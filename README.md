@@ -2,6 +2,7 @@
 FastAPI 백엔드 &amp; Docker 인프라
 
 # 파일 구조
+```
 agetrust-backend/
 ├── app/
 │   ├── __init__.py
@@ -24,3 +25,4 @@ agetrust-backend/
 ├── Dockerfile                   # FastAPI 백엔드 단독 도커파일
 ├── docker-compose.yml           # FastAPI + PostgreSQL + Kafka 인프라 일원화
 └── requirements.txt             # 파이썬 의존성 패키지 목록
+```
