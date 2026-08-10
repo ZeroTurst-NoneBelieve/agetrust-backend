@@ -31,16 +31,5 @@ agetrust-backend/
 
 # 환경변수
 
-`.env` 파일은 git에 올라가지 않으므로, 저장소를 새로 clone했다면 프로젝트 루트에 직접 만들어야 한다. 아래 값을 그대로 채우면 `docker-compose.yml`의 기본값과 동일하게 로컬에서 바로 동작한다.
+`.env` 관리
 
-```
-POSTGRES_USER=agetrust_user
-POSTGRES_PASSWORD=agetrust_password
-POSTGRES_DB=agetrust_db
-
-DATABASE_URL=postgresql+asyncpg://agetrust_user:agetrust_password@postgres:5432/agetrust_db
-
-SECRET_KEY=change-me-in-real-env
-```
-
-`.env` 파일이 없어도 `docker-compose.yml`에 동일한 기본값이 설정되어 있어 로컬 개발은 가능하다. 다만 비밀번호를 다르게 쓰거나 `SECRET_KEY`처럼 실제 보안이 필요한 값을 관리하려면 `.env`를 직접 만들어 오버라이드해야 한다.
