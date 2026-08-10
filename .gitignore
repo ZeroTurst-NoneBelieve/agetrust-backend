@@ -1,0 +1,70 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---- Build / packaging ----
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+lib/
+lib64/
+sdist/
+wheels/
+MANIFEST
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Environment variables / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---- Type checking / lint caches ----
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Alembic ----
+# NOTE: alembic/versions/*.py (migration scripts) must stay tracked in git.
+# Only ignore local sqlite artifacts if a sqlite DB is ever used for quick testing.
+*.sqlite3
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.iml
+*.swp
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Logs ----
+*.log
+
+# ---- Docker ----
+docker-compose.override.yml

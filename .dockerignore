@@ -1,0 +1,57 @@
+# ---- VCS ----
+.git
+.gitignore
+.gitattributes
+
+# ---- Environment variables / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Python cache / build artifacts ----
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Testing / lint / type-check caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.iml
+*.swp
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Logs ----
+*.log
+
+# ---- Docs (not needed inside the image) ----
+README.md
+*.md
+
+# ---- Docker / compose files themselves ----
+Dockerfile
+docker-compose*.yml
+.dockerignore
