@@ -47,11 +47,21 @@ async def create_challenge(
     )
 
 
-async def _log_and_return(db: AsyncSession, challenge_id: int, is_vc_valid: bool,
+async def _log_and_return(db: AsyncSession, challenge: VerificationChallenge, is_vc_valid: bool,
                            is_vp_valid: bool, is_face_matched: bool,
                            result: VerificationResultStatus, failure_code: str | None) -> VerifyResponse:
+    """검증 결과를 기록하고 challenge를 소모 처리한다.
+
+    challenge는 replay 방지를 위한 일회용 nonce이므로, 성공/실패와 무관하게
+    한 번 검증을 시도한 시점에 CONSUMED로 전이시킨다.
+    실패 경로에서 PENDING으로 남겨두면 같은 challenge로 재시도가 가능해지고,
+    verification_logs.challenge_id UNIQUE 제약을 위반해 IntegrityError(500)가 발생한다.
+    사용자는 실패 시 새 challenge를 발급받아 재시도한다.
+    """
+    challenge.status = "CONSUMED"
+    challenge.consumed_at = datetime.now(timezone.utc)
     db.add(VerificationLog(
-        challenge_id=challenge_id, is_vc_valid=is_vc_valid, is_vp_valid=is_vp_valid,
+        challenge_id=challenge.id, is_vc_valid=is_vc_valid, is_vp_valid=is_vp_valid,
         is_face_matched=is_face_matched, result_status=result.value, failure_code=failure_code,
     ))
     await db.commit()
@@ -77,13 +87,13 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
             failure_code="CHALLENGE_ALREADY_USED",
         )
     if datetime.now(timezone.utc) > challenge.expires_at:
-        return await _log_and_return(db, challenge.id, False, False, False,
+        return await _log_and_return(db, challenge, False, False, False,
                                       VerificationResultStatus.FAIL_EXPIRED, "CHALLENGE_EXPIRED")
 
     try:
         vc_payload = decode_vc(body.credential)
     except VcError as e:
-        return await _log_and_return(db, challenge.id, False, False, False, e.code, "VC_SIGNATURE_INVALID")
+        return await _log_and_return(db, challenge, False, False, False, e.code, "VC_SIGNATURE_INVALID")
 
     credential_id = vc_payload.get("jti")
     holder_did = vc_payload.get("sub")
@@ -91,30 +101,26 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
     result = await db.execute(select(VcCredential).where(VcCredential.credential_id == credential_id))
     vc_record = result.scalar_one_or_none()
     if vc_record is None:
-        return await _log_and_return(db, challenge.id, False, False, False,
+        return await _log_and_return(db, challenge, False, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VC, "VC_NOT_FOUND")
     if vc_record.status != "ACTIVE":
-        return await _log_and_return(db, challenge.id, True, False, False,
+        return await _log_and_return(db, challenge, True, False, False,
                                       VerificationResultStatus.FAIL_REVOKED_VC, "VC_REVOKED")
 
     result = await db.execute(select(Device).where(Device.holder_did == holder_did))
     device = result.scalar_one_or_none()
     if device is None or not device.holder_public_key:
-        return await _log_and_return(db, challenge.id, True, False, False,
+        return await _log_and_return(db, challenge, True, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VP, "HOLDER_KEY_NOT_FOUND")
 
     vp_ok = verify_holder_signature(device.holder_public_key, body.challenge_hash, body.holder_signature_b64)
     if not vp_ok:
-        return await _log_and_return(db, challenge.id, True, False, False,
+        return await _log_and_return(db, challenge, True, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VP, "HOLDER_SIGNATURE_INVALID")
 
     if not body.face_matched:
-        challenge.status = "CONSUMED"
-        challenge.consumed_at = datetime.now(timezone.utc)
-        return await _log_and_return(db, challenge.id, True, True, False,
+        return await _log_and_return(db, challenge, True, True, False,
                                       VerificationResultStatus.FAIL_FACE_MISMATCH, "FACE_NOT_MATCHED")
 
-    challenge.status = "CONSUMED"
-    challenge.consumed_at = datetime.now(timezone.utc)
-    return await _log_and_return(db, challenge.id, True, True, True,
+    return await _log_and_return(db, challenge, True, True, True,
                                   VerificationResultStatus.SUCCESS, None)

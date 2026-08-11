@@ -190,6 +190,15 @@ async def main():
         }, headers=kiosk_header)
         check("VP 서명 위조 FAIL_INVALID_VP", r.json()["result_status"] == "FAIL_INVALID_VP")
 
+        # 실패한 challenge를 같은 값으로 재시도했을 때 500이 나면 안 된다.
+        # (실패 경로에서 challenge가 PENDING으로 남으면 verification_logs.challenge_id
+        #  UNIQUE 제약을 위반해 IntegrityError -> 500이 발생한다)
+        r = await c.post("/api/v1/verification-logs", json={
+            "challenge_hash": ch3, "credential": vc_jwt, "holder_signature_b64": fake_sig, "face_matched": True,
+        }, headers=kiosk_header)
+        check("실패 후 재시도 500 안 남", r.status_code == 200)
+        check("실패 후 재시도 CHALLENGE_ALREADY_USED", r.json()["failure_code"] == "CHALLENGE_ALREADY_USED")
+
         vc_payload = pyjwt.decode(vc_jwt, options={"verify_signature": False})
         async with AsyncSessionLocal() as db:
             from app.models import VcCredential
