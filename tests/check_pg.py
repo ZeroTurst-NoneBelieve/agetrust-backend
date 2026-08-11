@@ -127,9 +127,25 @@ async def main():
         r = await c.post("/api/v1/did/issue", json={"adult_verification_id": av_id}, headers=auth_header)
         check("VC 발급 200", r.status_code == 200)
         vc_jwt = r.json()["credential"]
+        r_issuer_did = r.json()["issuer_did"]
 
         r = await c.post("/api/v1/did/issue", json={"adult_verification_id": r2.json()["id"]}, headers=auth_header)
         check("실패기록으로 발급시도 400", r.status_code == 400)
+
+        print("\n[4-1] DID Document 조회 (W3C DID Core)")
+        r = await c.get("/api/v1/did/issuer")
+        check("발급자 DID Document 200", r.status_code == 200)
+        doc = r.json()
+        check("DID Document id 일치", doc["id"] == r_issuer_did)
+        check("verificationMethod Ed25519VerificationKey2020",
+              doc["verificationMethod"][0]["type"] == "Ed25519VerificationKey2020")
+        check("@context에 DID Core 포함", "https://www.w3.org/ns/did/v1" in doc["@context"])
+
+        r = await c.get(f"/api/v1/did/{holder_did}")
+        check("holder DID Document 200", r.status_code == 200 and r.json()["id"] == holder_did)
+
+        r = await c.get("/api/v1/did/did:key:not-a-real-key")
+        check("잘못된 DID 400", r.status_code == 400)
 
         print("\n[5] 키오스크용 business -> store -> kiosk 체인 생성 (실제 FK 제약 확인)")
         async with AsyncSessionLocal() as db:

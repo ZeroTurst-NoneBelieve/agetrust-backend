@@ -32,11 +32,53 @@ VC_CONTEXT = "https://www.w3.org/2018/credentials/v1"
 VC_TYPE = "VerifiableCredential"
 ADULT_CREDENTIAL_TYPE = "AdultCredential"
 
+# W3C DID Core / did:key
+DID_CONTEXT = "https://www.w3.org/ns/did/v1"
+ED25519_2020_CONTEXT = "https://w3id.org/security/suites/ed25519-2020/v1"
+
 
 def public_key_to_did_key(public_key: Ed25519PublicKey) -> str:
     raw = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
     encoded = base58.b58encode(_MULTICODEC_ED25519_PUB + raw).decode()
     return f"did:key:z{encoded}"
+
+
+def build_did_document(did: str) -> dict:
+    """did:key 문자열로부터 W3C DID Document를 생성한다.
+
+    did:key는 DID 문자열 자체에 공개키가 인코딩되어 있는 방식이라,
+    별도 저장소 없이 DID만으로 Document를 결정론적으로 유도할 수 있다.
+    (https://w3c-ccg.github.io/did-method-key/)
+    """
+    prefix = "did:key:"
+    if not did.startswith(prefix + "z"):
+        raise ValueError("unsupported DID method (only did:key is supported)")
+
+    multibase = did[len(prefix):]          # 예: "z6Mk..."
+    try:
+        decoded = base58.b58decode(multibase[1:])
+    except Exception:
+        raise ValueError("invalid did:key encoding")
+
+    if (not decoded.startswith(_MULTICODEC_ED25519_PUB)
+            or len(decoded) != len(_MULTICODEC_ED25519_PUB) + 32):
+        raise ValueError("did:key is not an Ed25519 public key")
+
+    verification_method_id = f"{did}#{multibase}"
+    return {
+        "@context": [DID_CONTEXT, ED25519_2020_CONTEXT],
+        "id": did,
+        "verificationMethod": [
+            {
+                "id": verification_method_id,
+                "type": "Ed25519VerificationKey2020",
+                "controller": did,
+                "publicKeyMultibase": multibase,
+            }
+        ],
+        "authentication": [verification_method_id],
+        "assertionMethod": [verification_method_id],
+    }
 
 
 def public_key_pem(public_key: Ed25519PublicKey) -> str:
