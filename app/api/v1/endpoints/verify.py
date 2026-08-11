@@ -23,7 +23,7 @@ from app.schemas.verify import (
 router = APIRouter(prefix="/api/v1", tags=["verify"])
 
 
-@router.post("/verification-challenges", response_model=CreateChallengeResponse)
+@router.post("/did/challenges", response_model=CreateChallengeResponse)
 async def create_challenge(
     body: CreateChallengeRequest, kiosk: Kiosk = Depends(get_current_kiosk),
     db: AsyncSession = Depends(get_db),
@@ -68,7 +68,7 @@ async def _log_and_return(db: AsyncSession, challenge: VerificationChallenge, is
     return VerifyResponse(result_status=result.value, failure_code=failure_code)
 
 
-@router.post("/verification-logs", response_model=VerifyResponse)
+@router.post("/did/verify", response_model=VerifyResponse)
 async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
                   db: AsyncSession = Depends(get_db)):
     result = await db.execute(
@@ -93,7 +93,10 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
     try:
         vc_payload = decode_vc(body.credential)
     except VcError as e:
-        return await _log_and_return(db, challenge, False, False, False, e.code, "VC_SIGNATURE_INVALID")
+        # 만료와 서명/구조 오류를 구분해서 기록한다.
+        failure_code = ("VC_EXPIRED" if e.code == VerificationResultStatus.FAIL_EXPIRED
+                        else "VC_SIGNATURE_INVALID")
+        return await _log_and_return(db, challenge, False, False, False, e.code, failure_code)
 
     credential_id = vc_payload.get("jti")
     holder_did = vc_payload.get("sub")

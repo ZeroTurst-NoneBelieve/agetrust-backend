@@ -149,43 +149,43 @@ async def main():
         check("business->store->kiosk FK 체인 정상 생성", True)
         kiosk_header = {"X-Kiosk-Key": f"{kiosk_identifier}:{raw_key}"}
 
-        r = await c.post("/api/v1/verification-challenges", json={"transport_type": "QR"},
+        r = await c.post("/api/v1/did/challenges", json={"transport_type": "QR"},
                           headers={"X-Kiosk-Key": f"{kiosk_identifier}:wrong-key"})
         check("잘못된 키오스크 키 401", r.status_code == 401)
 
         print("\n[6] 키오스크 인증 - 성공 케이스")
-        r = await c.post("/api/v1/verification-challenges", json={"transport_type": "QR"}, headers=kiosk_header)
+        r = await c.post("/api/v1/did/challenges", json={"transport_type": "QR"}, headers=kiosk_header)
         check("challenge 생성 200", r.status_code == 200)
         challenge_hash = r.json()["challenge_hash"]
 
         holder_sig = base64.b64encode(holder_priv.sign(challenge_hash.encode())).decode()
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": challenge_hash, "credential": vc_jwt,
             "holder_signature_b64": holder_sig, "face_matched": True,
         }, headers=kiosk_header)
         check("최종 검증 200", r.status_code == 200)
         check("SUCCESS", r.json()["result_status"] == "SUCCESS")
 
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": challenge_hash, "credential": vc_jwt,
             "holder_signature_b64": holder_sig, "face_matched": True,
         }, headers=kiosk_header)
         check("challenge 재사용 차단", r.json()["result_status"] == "FAIL_CHALLENGE")
 
         print("\n[7] 키오스크 인증 - 실패 케이스들")
-        r = await c.post("/api/v1/verification-challenges", json={"transport_type": "QR"}, headers=kiosk_header)
+        r = await c.post("/api/v1/did/challenges", json={"transport_type": "QR"}, headers=kiosk_header)
         ch2 = r.json()["challenge_hash"]
         sig2 = base64.b64encode(holder_priv.sign(ch2.encode())).decode()
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": ch2, "credential": vc_jwt, "holder_signature_b64": sig2, "face_matched": False,
         }, headers=kiosk_header)
         check("얼굴 불일치 FAIL_FACE_MISMATCH", r.json()["result_status"] == "FAIL_FACE_MISMATCH")
 
-        r = await c.post("/api/v1/verification-challenges", json={"transport_type": "QR"}, headers=kiosk_header)
+        r = await c.post("/api/v1/did/challenges", json={"transport_type": "QR"}, headers=kiosk_header)
         ch3 = r.json()["challenge_hash"]
         fake_priv = Ed25519PrivateKey.generate()
         fake_sig = base64.b64encode(fake_priv.sign(ch3.encode())).decode()
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": ch3, "credential": vc_jwt, "holder_signature_b64": fake_sig, "face_matched": True,
         }, headers=kiosk_header)
         check("VP 서명 위조 FAIL_INVALID_VP", r.json()["result_status"] == "FAIL_INVALID_VP")
@@ -193,7 +193,7 @@ async def main():
         # 실패한 challenge를 같은 값으로 재시도했을 때 500이 나면 안 된다.
         # (실패 경로에서 challenge가 PENDING으로 남으면 verification_logs.challenge_id
         #  UNIQUE 제약을 위반해 IntegrityError -> 500이 발생한다)
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": ch3, "credential": vc_jwt, "holder_signature_b64": fake_sig, "face_matched": True,
         }, headers=kiosk_header)
         check("실패 후 재시도 500 안 남", r.status_code == 200)
@@ -209,10 +209,10 @@ async def main():
             )
             await db.commit()
 
-        r = await c.post("/api/v1/verification-challenges", json={"transport_type": "QR"}, headers=kiosk_header)
+        r = await c.post("/api/v1/did/challenges", json={"transport_type": "QR"}, headers=kiosk_header)
         ch4 = r.json()["challenge_hash"]
         sig4 = base64.b64encode(holder_priv.sign(ch4.encode())).decode()
-        r = await c.post("/api/v1/verification-logs", json={
+        r = await c.post("/api/v1/did/verify", json={
             "challenge_hash": ch4, "credential": vc_jwt, "holder_signature_b64": sig4, "face_matched": True,
         }, headers=kiosk_header)
         check("폐기된 VC FAIL_REVOKED_VC", r.json()["result_status"] == "FAIL_REVOKED_VC")
