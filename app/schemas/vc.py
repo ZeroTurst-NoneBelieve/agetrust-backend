@@ -4,10 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class AdultVerificationRequest(BaseModel):
-    device_id: int
-    age_check_passed: bool
-    id_face_match_passed: bool
+    device_id: int # 단말 무결성 증명(Play Integrity / App Attest) 토큰.
+    age_check_passed: bool  # MVP에서는 검증하지 않고 받기만 한다. 추후 도입 시
+    id_face_match_passed: bool # 필드 추가 없이 검증 로직만 붙이면 되도록 계약을 미리 열어둔다.
     liveness_passed: bool | None = None
+    attestation: str | None = None  
 
 
 class AdultVerificationResponse(BaseModel):
