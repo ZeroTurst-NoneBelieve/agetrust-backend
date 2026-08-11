@@ -44,6 +44,9 @@ async def record_adult_verification(
         age_check_passed=body.age_check_passed,
         id_face_match_passed=body.id_face_match_passed,
         liveness_passed=body.liveness_passed,
+        age_policy_version=body.age_policy_version,
+        model_version=body.model_version,
+        threshold_version=body.threshold_version,
         result_status=result_status.value, failure_code=failure_code,
     )
     db.add(row)
@@ -75,7 +78,8 @@ async def issue_credential(
     vc_row = VcCredential(
         user_id=user.id, device_id=device.id, adult_verification_id=av.id,
         credential_id=credential_id, holder_did=device.holder_did,
-        issuer_did=ISSUER_DID, status="ACTIVE", expires_at=expires_at,
+        issuer_did=ISSUER_DID, credential_format="JWT_VC",
+        status="ACTIVE", expires_at=expires_at,
     )
     db.add(vc_row)
     await db.commit()

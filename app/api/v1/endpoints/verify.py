@@ -47,7 +47,8 @@ async def create_challenge(
     )
 
 
-async def _log_and_return(db: AsyncSession, challenge: VerificationChallenge, is_vc_valid: bool,
+async def _log_and_return(db: AsyncSession, challenge: VerificationChallenge,
+                           body: VerifyRequest, is_vc_valid: bool,
                            is_vp_valid: bool, is_face_matched: bool,
                            result: VerificationResultStatus, failure_code: str | None) -> VerifyResponse:
     """검증 결과를 기록하고 challenge를 소모 처리한다.
@@ -62,7 +63,9 @@ async def _log_and_return(db: AsyncSession, challenge: VerificationChallenge, is
     challenge.consumed_at = datetime.now(timezone.utc)
     db.add(VerificationLog(
         challenge_id=challenge.id, is_vc_valid=is_vc_valid, is_vp_valid=is_vp_valid,
-        is_face_matched=is_face_matched, result_status=result.value, failure_code=failure_code,
+        is_face_matched=is_face_matched, is_liveness_valid=body.liveness_passed,
+        face_model_version=body.face_model_version, threshold_version=body.threshold_version,
+        result_status=result.value, failure_code=failure_code,
     ))
     await db.commit()
     return VerifyResponse(result_status=result.value, failure_code=failure_code)
@@ -87,7 +90,7 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
             failure_code="CHALLENGE_ALREADY_USED",
         )
     if datetime.now(timezone.utc) > challenge.expires_at:
-        return await _log_and_return(db, challenge, False, False, False,
+        return await _log_and_return(db, challenge, body, False, False, False,
                                       VerificationResultStatus.FAIL_EXPIRED, "CHALLENGE_EXPIRED")
 
     try:
@@ -96,7 +99,7 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
         # 만료와 서명/구조 오류를 구분해서 기록한다.
         failure_code = ("VC_EXPIRED" if e.code == VerificationResultStatus.FAIL_EXPIRED
                         else "VC_SIGNATURE_INVALID")
-        return await _log_and_return(db, challenge, False, False, False, e.code, failure_code)
+        return await _log_and_return(db, challenge, body, False, False, False, e.code, failure_code)
 
     credential_id = vc_payload.get("jti")
     holder_did = vc_payload.get("sub")
@@ -104,26 +107,26 @@ async def verify(body: VerifyRequest, kiosk: Kiosk = Depends(get_current_kiosk),
     result = await db.execute(select(VcCredential).where(VcCredential.credential_id == credential_id))
     vc_record = result.scalar_one_or_none()
     if vc_record is None:
-        return await _log_and_return(db, challenge, False, False, False,
+        return await _log_and_return(db, challenge, body, False, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VC, "VC_NOT_FOUND")
     if vc_record.status != "ACTIVE":
-        return await _log_and_return(db, challenge, True, False, False,
+        return await _log_and_return(db, challenge, body, True, False, False,
                                       VerificationResultStatus.FAIL_REVOKED_VC, "VC_REVOKED")
 
     result = await db.execute(select(Device).where(Device.holder_did == holder_did))
     device = result.scalar_one_or_none()
     if device is None or not device.holder_public_key:
-        return await _log_and_return(db, challenge, True, False, False,
+        return await _log_and_return(db, challenge, body, True, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VP, "HOLDER_KEY_NOT_FOUND")
 
     vp_ok = verify_holder_signature(device.holder_public_key, body.challenge_hash, body.holder_signature_b64)
     if not vp_ok:
-        return await _log_and_return(db, challenge, True, False, False,
+        return await _log_and_return(db, challenge, body, True, False, False,
                                       VerificationResultStatus.FAIL_INVALID_VP, "HOLDER_SIGNATURE_INVALID")
 
     if not body.face_matched:
-        return await _log_and_return(db, challenge, True, True, False,
+        return await _log_and_return(db, challenge, body, True, True, False,
                                       VerificationResultStatus.FAIL_FACE_MISMATCH, "FACE_NOT_MATCHED")
 
-    return await _log_and_return(db, challenge, True, True, True,
+    return await _log_and_return(db, challenge, body, True, True, True,
                                   VerificationResultStatus.SUCCESS, None)
