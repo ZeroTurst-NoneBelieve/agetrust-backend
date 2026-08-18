@@ -78,10 +78,13 @@ def build_did_document(did: str) -> dict:
     }
 
 
-def issue_vc(holder_did: str, expires_days: int | None = None) -> tuple[str, str]:
+def issue_vc(
+    holder_did: str,
+    expires_days: int | None = None,
+) -> tuple[str, str, datetime | None]:
     """최소 성인 여부 클레임만 담은 W3C VC JWT를 발급한다."""
     credential_id = f"urn:uuid:{uuid.uuid4()}"
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
 
     payload = {
         "iss": ISSUER_DID,
@@ -100,8 +103,9 @@ def issue_vc(holder_did: str, expires_days: int | None = None) -> tuple[str, str
     }
 
     days = expires_days if expires_days is not None else settings.vc_expire_days
-    if days:
-        payload["exp"] = now + timedelta(days=days)
+    expires_at = now + timedelta(days=days) if days else None
+    if expires_at is not None:
+        payload["exp"] = expires_at
 
     token = jwt.encode(payload, _issuer_private_key, algorithm="EdDSA")
-    return token, credential_id
+    return token, credential_id, expires_at

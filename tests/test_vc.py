@@ -2,10 +2,13 @@ import asyncio
 import base64
 import os
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import jwt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import HTTPException
 
 _ISSUER_KEY_BYTES = bytes(range(32))
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
@@ -20,13 +23,19 @@ from app.core.vc import (  # noqa: E402
     build_did_document,
     issue_vc,
 )
+from app.api.v1.endpoints.vc import (  # noqa: E402
+    issue_credential,
+    record_adult_verification,
+)
 from app.main import app  # noqa: E402
+from app.models import AdultVerification, Device, VcCredential  # noqa: E402
+from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
 
 
 class VcCoreTests(unittest.TestCase):
     def test_issue_vc_uses_fixed_issuer_key_and_minimum_claims(self):
         holder_did = ISSUER_DID
-        token, credential_id = issue_vc(holder_did, expires_days=1)
+        token, credential_id, expires_at = issue_vc(holder_did, expires_days=1)
 
         public_key = Ed25519PrivateKey.from_private_bytes(
             _ISSUER_KEY_BYTES
@@ -45,9 +54,13 @@ class VcCoreTests(unittest.TestCase):
             {"id": holder_did, "isOver19": True},
         )
         self.assertIn("exp", payload)
+        self.assertEqual(
+            datetime.fromtimestamp(payload["exp"], timezone.utc),
+            expires_at,
+        )
 
     def test_issue_vc_can_omit_expiration(self):
-        token, _ = issue_vc(ISSUER_DID, expires_days=0)
+        token, _, expires_at = issue_vc(ISSUER_DID, expires_days=0)
         payload = jwt.decode(
             token,
             options={"verify_signature": False},
@@ -55,6 +68,7 @@ class VcCoreTests(unittest.TestCase):
         )
 
         self.assertNotIn("exp", payload)
+        self.assertIsNone(expires_at)
 
     def test_build_did_document_exposes_same_did_key(self):
         document = build_did_document(ISSUER_DID)
@@ -114,6 +128,156 @@ class VcRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("only did:key", response.json()["detail"])
+
+
+class _FakeDb:
+    def __init__(self, rows=None):
+        self.rows = rows or {}
+        self.added = []
+        self.commits = 0
+
+    async def get(self, model, key):
+        return self.rows.get((model, key))
+
+    def add(self, row):
+        self.added.append(row)
+
+    async def commit(self):
+        self.commits += 1
+
+    async def refresh(self, row):
+        return None
+
+
+class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
+    user = SimpleNamespace(id=1)
+
+    async def test_record_adult_verification_persists_success(self):
+        device = SimpleNamespace(id=2, user_id=1, status="ACTIVE")
+        db = _FakeDb({(Device, 2): device})
+        body = AdultVerificationRequest(
+            device_id=2,
+            age_check_passed=True,
+            id_face_match_passed=True,
+            liveness_passed=True,
+            age_policy_version="2026-KR-19",
+            model_version="MobileFaceNet-v1.0",
+            threshold_version="th-2026-08",
+        )
+
+        row = await record_adult_verification(body, self.user, db)
+
+        self.assertEqual(row.user_id, self.user.id)
+        self.assertEqual(row.device_id, device.id)
+        self.assertEqual(row.result_status, "SUCCESS")
+        self.assertIsNone(row.failure_code)
+        self.assertEqual(db.added, [row])
+        self.assertEqual(db.commits, 1)
+
+    async def test_record_adult_verification_rejects_inactive_device(self):
+        device = SimpleNamespace(id=2, user_id=1, status="LOST")
+        db = _FakeDb({(Device, 2): device})
+        body = AdultVerificationRequest(
+            device_id=2,
+            age_check_passed=True,
+            id_face_match_passed=True,
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await record_adult_verification(body, self.user, db)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(db.commits, 0)
+
+    async def test_issue_credential_rejects_invalidated_verification(self):
+        verification = SimpleNamespace(
+            id=3,
+            user_id=1,
+            device_id=2,
+            result_status="SUCCESS",
+            invalidated_at=datetime.now(timezone.utc),
+        )
+        db = _FakeDb({(AdultVerification, 3): verification})
+
+        with self.assertRaises(HTTPException) as raised:
+            await issue_credential(IssueVcRequest(adult_verification_id=3), self.user, db)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "adult verification was invalidated",
+        )
+        self.assertEqual(db.commits, 0)
+
+    async def test_issue_credential_rejects_inactive_device(self):
+        verification = SimpleNamespace(
+            id=3,
+            user_id=1,
+            device_id=2,
+            result_status="SUCCESS",
+            invalidated_at=None,
+        )
+        device = SimpleNamespace(
+            id=2,
+            user_id=1,
+            status="REVOKED",
+            holder_did=ISSUER_DID,
+        )
+        db = _FakeDb(
+            {
+                (AdultVerification, 3): verification,
+                (Device, 2): device,
+            }
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await issue_credential(IssueVcRequest(adult_verification_id=3), self.user, db)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(db.commits, 0)
+
+    async def test_issue_credential_persists_signed_expiration(self):
+        verification = SimpleNamespace(
+            id=3,
+            user_id=1,
+            device_id=2,
+            result_status="SUCCESS",
+            invalidated_at=None,
+        )
+        device = SimpleNamespace(
+            id=2,
+            user_id=1,
+            status="ACTIVE",
+            holder_did=ISSUER_DID,
+        )
+        db = _FakeDb(
+            {
+                (AdultVerification, 3): verification,
+                (Device, 2): device,
+            }
+        )
+
+        response = await issue_credential(
+            IssueVcRequest(adult_verification_id=3),
+            self.user,
+            db,
+        )
+        payload = jwt.decode(
+            response.credential,
+            options={"verify_signature": False},
+            algorithms=["EdDSA"],
+        )
+
+        self.assertEqual(db.commits, 1)
+        self.assertEqual(len(db.added), 1)
+        self.assertIsInstance(db.added[0], VcCredential)
+        self.assertEqual(db.added[0].expires_at, response.expires_at)
+        self.assertEqual(
+            datetime.fromtimestamp(payload["exp"], timezone.utc),
+            response.expires_at,
+        )
 
 
 if __name__ == "__main__":

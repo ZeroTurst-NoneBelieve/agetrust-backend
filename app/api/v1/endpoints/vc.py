@@ -1,12 +1,9 @@
 """최초 성인 인증 결과 기록, VC 발급 및 DID Document 조회."""
 
-from datetime import datetime, timedelta, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.config import settings
 from app.core.vc import ISSUER_DID, build_did_document, issue_vc
 from app.database import get_db
 from app.models import AdultVerification, Device, User, VcCredential
@@ -31,6 +28,11 @@ async def record_adult_verification(
     device = await db.get(Device, body.device_id)
     if device is None or device.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+    if device.status != "ACTIVE":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="device is not active",
+        )
 
     if not body.age_check_passed:
         result_status, failure_code = (
@@ -86,20 +88,27 @@ async def issue_credential(
             status.HTTP_400_BAD_REQUEST,
             detail="adult verification was not successful",
         )
+    if verification.invalidated_at is not None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="adult verification was invalidated",
+        )
 
     device = await db.get(Device, verification.device_id)
-    if device is None or not device.holder_did:
+    if device is None or device.user_id != user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+    if device.status != "ACTIVE":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="device is not active",
+        )
+    if not device.holder_did:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail="device has no holder_did. Register device and bind holder key first.",
         )
 
-    vc_jwt, credential_id = issue_vc(device.holder_did)
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(days=settings.vc_expire_days)
-        if settings.vc_expire_days
-        else None
-    )
+    vc_jwt, credential_id, expires_at = issue_vc(device.holder_did)
 
     vc_row = VcCredential(
         user_id=user.id,
