@@ -1,6 +1,6 @@
 """JWT / 비밀번호 - 로그인 관련 보안 유틸.
 
-DID/VC 서명은 app/core/did_crypto.py 에 분리했다.
+DID 키 인코딩은 app/core/did_key.py 에 분리했다.
 """
 
 import uuid
