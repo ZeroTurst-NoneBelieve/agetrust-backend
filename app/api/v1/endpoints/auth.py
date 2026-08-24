@@ -9,7 +9,7 @@ import base64
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -27,7 +27,7 @@ from app.core.security import (
     verify_password,
 )
 from app.database import get_db
-from app.models import Device, PhoneVerificationRequest, User
+from app.models import Device, PhoneVerificationRequest, User, VcCredential
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
 from app.schemas.errors import AuthError
 from app.schemas.user import (
@@ -65,7 +65,8 @@ async def request_phone_otp(body: PhoneRequestBody, db: AsyncSession = Depends(g
     row.otp_digest = hash_otp(otp, str(row.id))
     await db.commit()
 
-    print(f"[SMS 시뮬레이터] {body.phone_number} 로 인증번호 발송: {otp}")
+    if settings.dev_mode:
+        print(f"[SMS 시뮬레이터] {body.phone_number} 로 인증번호 발송: {otp}")
 
     return PhoneRequestResponse(
         verification_id=str(row.id), expires_at=row.expires_at,
@@ -197,7 +198,23 @@ async def bind_holder_key(
     except Exception:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="key ownership proof failed")
 
-    device.holder_did = public_key_to_did_key(pub)
+    new_holder_did = public_key_to_did_key(pub)
+
+    # 재바인딩으로 holder_did가 바뀌면, 이전 DID로 발급된 VC는 더 이상
+    # 이 기기의 현재 소유자를 가리키지 않는다. did:key는 자기완결적이라
+    # 키오스크가 서버를 조회하지 않으므로, 최소한 서버 DB에 폐기 사실을 남긴다.
+    # (실제 차단은 폐기 목록 동기화가 구현되어야 완성된다 — #22 참고)
+    if device.holder_did is not None and device.holder_did != new_holder_did:
+        await db.execute(
+            update(VcCredential)
+            .where(
+                VcCredential.device_id == device.id,
+                VcCredential.status == "ACTIVE",
+            )
+            .values(status="REVOKED", revoked_at=datetime.now(timezone.utc))
+        )
+
+    device.holder_did = new_holder_did
     device.holder_public_key = body.holder_public_key_pem
     await db.commit()
     await db.refresh(device)
