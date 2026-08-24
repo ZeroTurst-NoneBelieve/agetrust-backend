@@ -18,7 +18,12 @@ class Settings(BaseSettings):
     otp_max_attempts: int = 5
     vc_expire_days: int = 365
     challenge_expire_seconds: int = 120
-    dev_mode: bool = True
+
+    # 개발 편의 기능(OTP 응답 노출, 콘솔 출력) 스위치.
+    # 기본값을 False로 두어, 명시적으로 켜지 않는 한 인증번호가
+    # 응답이나 로그로 새어 나가지 않도록 한다.
+    # 로컬 개발 시에만 .env에 DEV_MODE=true 를 넣어 사용한다.
+    dev_mode: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
