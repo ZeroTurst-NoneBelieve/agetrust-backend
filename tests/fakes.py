@@ -97,3 +97,81 @@ class FakeDb:
             return str(statement.compile(compile_kwargs={"literal_binds": True}))
         except Exception:
             return str(statement)
+
+
+# ---------------------------------------------------------------------------
+# Outbox → Kafka Publisher (#9) 대역
+# ---------------------------------------------------------------------------
+class FakeRecordMetadata:
+    """aiokafka가 send_and_wait에서 돌려주는 RecordMetadata의 최소 대역."""
+
+    def __init__(self, topic, partition, offset):
+        self.topic = topic
+        self.partition = partition
+        self.offset = offset
+
+
+class FakeProducer:
+    """AIOKafkaProducer의 최소 대역.
+
+    `fail_with`를 주면 전송이 그 예외로 실패한다. 브로커가 죽었을 때의
+    동작을 검증하기 위한 것이다.
+    """
+
+    def __init__(self, *, fail_with=None, topic="agetrust.audit-events"):
+        self.sent = []
+        self.fail_with = fail_with
+        self.topic = topic
+        self._offset = 0
+
+    async def send_and_wait(self, topic, *, value, key):
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.sent.append({"topic": topic, "key": key, "value": value})
+        metadata = FakeRecordMetadata(topic, 0, self._offset)
+        self._offset += 1
+        return metadata
+
+
+class FakeOutboxDb:
+    """Publisher가 쓰는 만큼만 흉내낸 세션.
+
+    - `pending`   : _claim_pending이 집어갈 미발행 이벤트
+    - `backfills` : audit_logs에 Kafka 좌표를 되채운 UPDATE 문
+    """
+
+    def __init__(self, pending=None, *, backfill_error=None):
+        self.pending = list(pending or [])
+        self.backfills = []
+        self.commits = 0
+        self.selects = []
+        self.savepoints = 0
+        # 좌표 기록이 유니크 제약에 걸리는 상황을 재현하기 위한 것.
+        self.backfill_error = backfill_error
+
+    async def execute(self, statement, params=None):
+        text = str(statement)
+        if text.lstrip().upper().startswith("UPDATE AUDIT_LOGS"):
+            if self.backfill_error is not None:
+                raise self.backfill_error
+            self.backfills.append(statement)
+            return FakeResult()
+        self.selects.append(statement)
+        return FakeResult(rows=self.pending)
+
+    def begin_nested(self):
+        """SAVEPOINT 대역. 안에서 터진 예외는 밖으로 그대로 올려보낸다."""
+        self.savepoints += 1
+        return _FakeSavepoint()
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _FakeSavepoint:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        # 롤백만 하고 예외는 삼키지 않는다 (실제 SAVEPOINT와 같은 동작).
+        return False
