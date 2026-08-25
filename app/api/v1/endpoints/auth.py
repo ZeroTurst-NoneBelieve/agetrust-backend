@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.config import settings
+from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
 from app.core.security import (
     TokenError,
@@ -28,6 +29,11 @@ from app.core.security import (
 )
 from app.database import get_db
 from app.models import Device, PhoneVerificationRequest, User, VcCredential
+from app.schemas.audit import (
+    AuditActorType,
+    AuditAggregateType,
+    AuditEventType,
+)
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
 from app.schemas.errors import AuthError
 from app.schemas.user import (
@@ -88,10 +94,29 @@ async def verify_phone_otp(body: PhoneVerifyBody, db: AsyncSession = Depends(get
 
     if not verify_otp(body.otp, str(row.id), row.otp_digest):
         row.attempt_count += 1
+        await record_audit_event(
+            db,
+            event_type=AuditEventType.PHONE_VERIFICATION_FAILED.value,
+            actor_type=AuditActorType.USER.value,
+            actor_ref=mask_phone(row.phone_number),
+            aggregate_type=AuditAggregateType.PHONE_VERIFICATION.value,
+            aggregate_id=str(row.id),
+            payload={"reason": AuthError.OTP_MISMATCH.value, "attempt_count": row.attempt_count},
+        )
+        # 실패 이력이 롤백되지 않도록 예외 이전에 커밋한다.
         await db.commit()
         raise _fail(AuthError.OTP_MISMATCH)
 
     row.verified_at = datetime.now(timezone.utc)
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.PHONE_VERIFICATION_SUCCEEDED.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=mask_phone(row.phone_number),
+        aggregate_type=AuditAggregateType.PHONE_VERIFICATION.value,
+        aggregate_id=str(row.id),
+        payload={"attempt_count": row.attempt_count},
+    )
     await db.commit()
 
 
@@ -120,7 +145,18 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
     )
     db.add(user)
     verification.consumed_at = datetime.now(timezone.utc)
-    # users INSERT + phone_verification_requests UPDATE를 한 트랜잭션으로 커밋
+    await db.flush()  # audit의 aggregate_id로 쓸 user.id 확보
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.USER_SIGNED_UP.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.USER.value,
+        aggregate_id=str(user.id),
+        payload={"login_id": user.login_id, "phone": mask_phone(user.phone_number)},
+    )
+    # users INSERT + phone_verification_requests UPDATE + audit을 한 트랜잭션으로 커밋
     await db.commit()
     await db.refresh(user)
     return user
@@ -132,7 +168,34 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.login_id == body.login_id))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(body.password, user.password_hash):
+        await record_audit_event(
+            db,
+            event_type=AuditEventType.LOGIN_FAILED.value,
+            actor_type=AuditActorType.USER.value,
+            actor_ref=body.login_id,
+            aggregate_type=AuditAggregateType.USER.value,
+            aggregate_id=str(user.id) if user else None,
+            # 존재하지 않는 계정인지 비밀번호가 틀린 것인지는 남기지 않는다.
+            # 감사 로그가 계정 존재 여부를 알려주는 통로가 되면 안 된다.
+            payload={"reason": AuthError.INVALID_CREDENTIALS.value},
+        )
+        await db.commit()
         raise _fail(AuthError.INVALID_CREDENTIALS)
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.LOGIN_SUCCEEDED.value,
+        actor_type=(
+            AuditActorType.ADMIN.value
+            if user.platform_role == "ADMIN"
+            else AuditActorType.USER.value
+        ),
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.USER.value,
+        aggregate_id=str(user.id),
+        payload={"login_id": user.login_id, "platform_role": user.platform_role},
+    )
+    await db.commit()
 
     return TokenResponse(
         access_token=create_access_token(user.id, user.platform_role),
@@ -178,6 +241,17 @@ async def register_device(
     device = Device(user_id=user.id, device_identifier=body.device_identifier,
                     platform=body.platform, status="ACTIVE")
     db.add(device)
+    await db.flush()  # audit의 aggregate_id로 쓸 device.id 확보
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.DEVICE_REGISTERED.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.DEVICE.value,
+        aggregate_id=str(device.id),
+        payload={"device_identifier": device.device_identifier, "platform": device.platform},
+    )
     await db.commit()
     await db.refresh(device)
     return device
@@ -200,12 +274,16 @@ async def bind_holder_key(
 
     new_holder_did = public_key_to_did_key(pub)
 
+    previous_holder_did = device.holder_did
+    is_rebinding = previous_holder_did is not None and previous_holder_did != new_holder_did
+    revoked_count = 0
+
     # 재바인딩으로 holder_did가 바뀌면, 이전 DID로 발급된 VC는 더 이상
     # 이 기기의 현재 소유자를 가리키지 않는다. did:key는 자기완결적이라
     # 키오스크가 서버를 조회하지 않으므로, 최소한 서버 DB에 폐기 사실을 남긴다.
     # (실제 차단은 폐기 목록 동기화가 구현되어야 완성된다 — #22 참고)
-    if device.holder_did is not None and device.holder_did != new_holder_did:
-        await db.execute(
+    if is_rebinding:
+        result = await db.execute(
             update(VcCredential)
             .where(
                 VcCredential.device_id == device.id,
@@ -213,9 +291,31 @@ async def bind_holder_key(
             )
             .values(status="REVOKED", revoked_at=datetime.now(timezone.utc))
         )
+        revoked_count = result.rowcount or 0
 
     device.holder_did = new_holder_did
     device.holder_public_key = body.holder_public_key_pem
+
+    # 기기 분실 후 재바인딩은 사후 조사에서 가장 중요한 이벤트다.
+    # 몇 건의 VC가 폐기됐는지까지 남긴다.
+    await record_audit_event(
+        db,
+        event_type=(
+            AuditEventType.HOLDER_KEY_REBOUND.value
+            if is_rebinding
+            else AuditEventType.HOLDER_KEY_BOUND.value
+        ),
+        actor_type=AuditActorType.USER.value,
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.DEVICE.value,
+        aggregate_id=str(device.id),
+        payload={
+            "previous_holder_did": previous_holder_did,
+            "new_holder_did": new_holder_did,
+            "revoked_vc_count": revoked_count,
+        },
+    )
+
     await db.commit()
     await db.refresh(device)
     return device

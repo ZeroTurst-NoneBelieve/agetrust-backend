@@ -4,9 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.audit import record_audit_event
 from app.core.vc import ISSUER_DID, build_did_document, issue_vc
 from app.database import get_db
 from app.models import AdultVerification, Device, User, VcCredential
+from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
 from app.schemas.errors import AdultVerificationStatus
 from app.schemas.vc import (
     AdultVerificationRequest,
@@ -65,6 +67,28 @@ async def record_adult_verification(
         failure_code=failure_code,
     )
     db.add(row)
+    await db.flush()  # audit의 aggregate_id로 쓸 row.id 확보
+
+    # 성공·실패를 가리지 않고 남긴다. 실패 시도야말로 감사 추적의 대상이다.
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.ADULT_VERIFICATION_RECORDED.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.ADULT_VERIFICATION.value,
+        aggregate_id=str(row.id),
+        payload={
+            "device_id": body.device_id,
+            "result_status": result_status.value,
+            "failure_code": failure_code,
+            "age_check_passed": body.age_check_passed,
+            "id_face_match_passed": body.id_face_match_passed,
+            "liveness_passed": body.liveness_passed,
+            "age_policy_version": body.age_policy_version,
+            "model_version": body.model_version,
+            "threshold_version": body.threshold_version,
+        },
+    )
     await db.commit()
     await db.refresh(row)
     return row
@@ -122,6 +146,26 @@ async def issue_credential(
         expires_at=expires_at,
     )
     db.add(vc_row)
+    await db.flush()  # audit의 aggregate_id로 쓸 vc_row.id 확보
+
+    # 발급된 VC 본문(JWT)은 남기지 않는다. 감사 로그가 유출되면
+    # 그대로 사용 가능한 자격증명이 되기 때문이다. 식별자만 남긴다.
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.VC_ISSUED.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=str(user.id),
+        aggregate_type=AuditAggregateType.VC_CREDENTIAL.value,
+        aggregate_id=str(vc_row.id),
+        payload={
+            "credential_id": credential_id,
+            "device_id": device.id,
+            "adult_verification_id": verification.id,
+            "holder_did": device.holder_did,
+            "issuer_did": ISSUER_DID,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        },
+    )
     await db.commit()
 
     return IssueVcResponse(

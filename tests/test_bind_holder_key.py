@@ -21,6 +21,7 @@ from app.api.v1.endpoints.auth import bind_holder_key  # noqa: E402
 from app.core.did_key import public_key_to_did_key  # noqa: E402
 from app.models import Device  # noqa: E402
 from app.schemas.device import BindHolderKeyRequest  # noqa: E402
+from tests.fakes import FakeDb as _FakeDb  # noqa: E402
 
 
 def _make_key_material(device_id: int):
@@ -32,28 +33,6 @@ def _make_key_material(device_id: int):
     ).decode()
     signature = base64.b64encode(private_key.sign(str(device_id).encode())).decode()
     return pem, signature, public_key_to_did_key(public_key)
-
-
-class _FakeDb:
-    """execute()로 넘어온 UPDATE 문을 기록하는 가짜 세션."""
-
-    def __init__(self, rows=None):
-        self.rows = rows or {}
-        self.executed = []
-        self.commits = 0
-
-    async def get(self, model, key):
-        return self.rows.get((model, key))
-
-    async def execute(self, statement):
-        self.executed.append(statement)
-        return None
-
-    async def commit(self):
-        self.commits += 1
-
-    async def refresh(self, row):
-        return None
 
 
 class BindHolderKeyRevocationTests(unittest.IsolatedAsyncioTestCase):

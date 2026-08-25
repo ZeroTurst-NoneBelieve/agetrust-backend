@@ -30,6 +30,7 @@ from app.api.v1.endpoints.vc import (  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AdultVerification, Device, VcCredential  # noqa: E402
 from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
+from tests.fakes import FakeDb as _FakeDb  # noqa: E402
 
 
 class VcCoreTests(unittest.TestCase):
@@ -130,25 +131,6 @@ class VcRouteTests(unittest.TestCase):
         self.assertIn("only did:key", response.json()["detail"])
 
 
-class _FakeDb:
-    def __init__(self, rows=None):
-        self.rows = rows or {}
-        self.added = []
-        self.commits = 0
-
-    async def get(self, model, key):
-        return self.rows.get((model, key))
-
-    def add(self, row):
-        self.added.append(row)
-
-    async def commit(self):
-        self.commits += 1
-
-    async def refresh(self, row):
-        return None
-
-
 class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
     user = SimpleNamespace(id=1)
 
@@ -171,8 +153,12 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.device_id, device.id)
         self.assertEqual(row.result_status, "SUCCESS")
         self.assertIsNone(row.failure_code)
-        self.assertEqual(db.added, [row])
+        self.assertIn(row, db.added)
         self.assertEqual(db.commits, 1)
+        # 성인 인증은 성공·실패 모두 감사 로그로 남아야 한다 (#9).
+        self.assertEqual(len(db.audit_logs), 1)
+        self.assertEqual(db.audit_logs[0].event_type, "ADULT_VERIFICATION_RECORDED")
+        self.assertEqual(db.audit_logs[0].payload["result_status"], "SUCCESS")
 
     async def test_record_adult_verification_rejects_inactive_device(self):
         device = SimpleNamespace(id=2, user_id=1, status="LOST")
@@ -271,9 +257,13 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(db.commits, 1)
-        self.assertEqual(len(db.added), 1)
-        self.assertIsInstance(db.added[0], VcCredential)
-        self.assertEqual(db.added[0].expires_at, response.expires_at)
+        vc_rows = [r for r in db.added if isinstance(r, VcCredential)]
+        self.assertEqual(len(vc_rows), 1)
+        self.assertEqual(vc_rows[0].expires_at, response.expires_at)
+        # VC 발급도 감사 대상이다. 단, JWT 본문은 남기지 않는다 (#9).
+        self.assertEqual(len(db.audit_logs), 1)
+        self.assertEqual(db.audit_logs[0].event_type, "VC_ISSUED")
+        self.assertNotIn("credential", db.audit_logs[0].payload)
         self.assertEqual(
             datetime.fromtimestamp(payload["exp"], timezone.utc),
             response.expires_at,
