@@ -23,11 +23,17 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Set it in .env}
       ISSUER_PRIVATE_KEY: ${ISSUER_PRIVATE_KEY:?ISSUER_PRIVATE_KEY is required. Set it in .env}
+      # 시크릿이 아니라 배포 환경마다 달라지는 주소라서 기본값을 둔다.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
+      # Kafka는 healthy까지 기다리지 않는다. Publisher가 브로커 없음을 견디고
+      # 재시도하도록 만들었으므로, Kafka가 늦게 떠도 API는 즉시 뜨는 편이 낫다.
+      kafka:
+        condition: service_started
     volumes:
       - ./app:/app/app
       - ./alembic:/app/alembic
