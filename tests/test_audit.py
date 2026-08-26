@@ -164,6 +164,13 @@ class MaskPhoneTests(unittest.TestCase):
         self.assertIsNone(mask_phone(""))
         self.assertEqual(mask_phone("1234"), "****")
 
+    def test_masks_seven_digit_number_without_exposing_original(self):
+        self.assertEqual(mask_phone("+1234567"), "***4567")
+
+    def test_masks_five_and_six_digit_inputs(self):
+        self.assertEqual(mask_phone("12345"), "*2345")
+        self.assertEqual(mask_phone("123456"), "**3456")
+
 
 class PayloadSecretsTests(unittest.TestCase):
     """감사 로그에 그대로 재사용 가능한 비밀이 들어가면 안 된다."""

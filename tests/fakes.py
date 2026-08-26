@@ -33,8 +33,10 @@ class FakeDb:
     - `chain_tip`     : 마지막 AuditLog의 event_hash (해시 체인 tip)
     """
 
-    def __init__(self, rows=None, *, rowcount=0):
+    def __init__(self, rows=None, *, rowcount=0, scalar_results=None):
         self.rows = rows or {}
+        self.scalar_results = scalar_results or {}
+        self.scalar_query_hits = {}
         self.added = []
         self.executed = []
         self.audit_logs = []
@@ -42,10 +44,12 @@ class FakeDb:
         self.chain_tip = None
         self.commits = 0
         self.flushes = 0
+        self.get_calls = []
         self._rowcount = rowcount
         self._next_id = 1000
 
-    async def get(self, model, key):
+    async def get(self, model, key, **kwargs):
+        self.get_calls.append((model, key, kwargs))
         return self.rows.get((model, key))
 
     def add(self, row):
@@ -66,6 +70,18 @@ class FakeDb:
 
     async def execute(self, statement, params=None):
         text = self._render(statement)
+
+        # select(Model) 결과를 ORM 엔티티 기준으로 주입한다. 렌더된 SQL 문자열에
+        # 의존하지 않으므로 쿼리 포맷이 바뀌어도 의도한 테스트 대역이 동작한다.
+        entities = {
+            description.get("entity")
+            for description in getattr(statement, "column_descriptions", [])
+            if description.get("entity") is not None
+        }
+        for entity, scalar_result in self.scalar_results.items():
+            if entity in entities:
+                self.scalar_query_hits[entity] = self.scalar_query_hits.get(entity, 0) + 1
+                return FakeResult(scalar=scalar_result)
 
         # 감사 체인 append 구간을 직렬화하는 자문 잠금.
         if "pg_advisory_xact_lock" in text:

@@ -6,6 +6,7 @@ devices 관련 엔드포인트는 팀 endpoints 목록(auth/vc/verify/stores)에
 """
 
 import base64
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -25,7 +26,7 @@ from app.core.security import (
     hash_otp,
     hash_password,
     verify_otp,
-    verify_password,
+    verify_password_or_dummy,
 )
 from app.database import get_db
 from app.models import Device, PhoneVerificationRequest, User, VcCredential
@@ -48,10 +49,63 @@ from app.schemas.user import (
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
     return HTTPException(status_code=status_code, detail={"code": code.value})
+
+
+async def _record_phone_verification_failure(
+    db: AsyncSession,
+    *,
+    reason: AuthError,
+    row: PhoneVerificationRequest,
+) -> bool:
+    """OTP 검증 실패를 감사 로그에 남기고 커밋한다.
+
+    실제로 발급된 인증 요청의 실패 경로에서 record_audit_event를 매번
+    펼치면
+    분기마다 인자를 빠뜨리기 쉬워 한 곳으로 모았다.
+
+    소비·만료·시도 초과 상태를 같은 ID로 반복 호출해 감사 체인을 무한히
+    늘리지 못하도록 attempt_count를 상한으로 사용한다. OTP_MAX_ATTEMPTS는
+    상한에 처음 도달한 직후 한 번만 기록하고 이후 요청은 건너뛴다.
+    """
+    terminal_reason = reason in {
+        AuthError.OTP_ALREADY_CONSUMED,
+        AuthError.OTP_EXPIRED,
+        AuthError.OTP_MAX_ATTEMPTS,
+    }
+    if terminal_reason:
+        limit_reached = (
+            row.attempt_count > settings.otp_max_attempts
+            if reason is AuthError.OTP_MAX_ATTEMPTS
+            else row.attempt_count >= settings.otp_max_attempts
+        )
+        if limit_reached:
+            return False
+        row.attempt_count += 1
+
+    payload = {
+        "reason": reason.value,
+        "attempt_count": row.attempt_count,
+    }
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.PHONE_VERIFICATION_FAILED.value,
+        actor_type=AuditActorType.USER.value,
+        actor_ref=mask_phone(row.phone_number),
+        aggregate_type=AuditAggregateType.PHONE_VERIFICATION.value,
+        aggregate_id=str(row.id),
+        payload=payload,
+    )
+    # 실패 이력이 롤백되지 않도록 예외 이전에 커밋한다.
+    # 이 경로에는 감사 로그 외에 롤백되어야 할 업무 변경이 없다.
+    # (OTP_MISMATCH의 attempt_count 증가는 저장되어야 하는 값이다)
+    await db.commit()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -82,29 +136,56 @@ async def request_phone_otp(body: PhoneRequestBody, db: AsyncSession = Depends(g
 
 @router.post("/phone/verify", status_code=status.HTTP_204_NO_CONTENT)
 async def verify_phone_otp(body: PhoneVerifyBody, db: AsyncSession = Depends(get_db)):
-    row = await db.get(PhoneVerificationRequest, body.verification_id)
+    """OTP 검증.
+
+    실제로 발급된 요청의 실패는 감사 로그에 남기고 사유는 payload.reason으로
+    구분한다. 존재하지 않는 ID 조회는 인증 없이 감사 체인을 무한히 늘리는 통로가
+    되지 않도록 애플리케이션 경고 로그만 남긴다.
+    """
+    # 같은 인증 요청에 대한 동시 검증을 직렬화한다. 잠금이 없으면 두 요청이
+    # 같은 attempt_count를 읽고 각각 증가시켜 실패 횟수 하나가 유실될 수 있다.
+    row = await db.get(
+        PhoneVerificationRequest,
+        body.verification_id,
+        with_for_update=True,
+    )
     if row is None:
+        logger.warning(
+            "OTP verification requested for an unknown verification ID"
+        )
         raise _fail(AuthError.OTP_NOT_FOUND, status.HTTP_404_NOT_FOUND)
+
     if row.consumed_at is not None:
+        await _record_phone_verification_failure(
+            db,
+            reason=AuthError.OTP_ALREADY_CONSUMED,
+            row=row,
+        )
         raise _fail(AuthError.OTP_ALREADY_CONSUMED)
+
     if datetime.now(timezone.utc) > row.expires_at:
+        await _record_phone_verification_failure(
+            db,
+            reason=AuthError.OTP_EXPIRED,
+            row=row,
+        )
         raise _fail(AuthError.OTP_EXPIRED)
+
     if row.attempt_count >= settings.otp_max_attempts:
+        await _record_phone_verification_failure(
+            db,
+            reason=AuthError.OTP_MAX_ATTEMPTS,
+            row=row,
+        )
         raise _fail(AuthError.OTP_MAX_ATTEMPTS)
 
     if not verify_otp(body.otp, str(row.id), row.otp_digest):
         row.attempt_count += 1
-        await record_audit_event(
+        await _record_phone_verification_failure(
             db,
-            event_type=AuditEventType.PHONE_VERIFICATION_FAILED.value,
-            actor_type=AuditActorType.USER.value,
-            actor_ref=mask_phone(row.phone_number),
-            aggregate_type=AuditAggregateType.PHONE_VERIFICATION.value,
-            aggregate_id=str(row.id),
-            payload={"reason": AuthError.OTP_MISMATCH.value, "attempt_count": row.attempt_count},
+            reason=AuthError.OTP_MISMATCH,
+            row=row,
         )
-        # 실패 이력이 롤백되지 않도록 예외 이전에 커밋한다.
-        await db.commit()
         raise _fail(AuthError.OTP_MISMATCH)
 
     row.verified_at = datetime.now(timezone.utc)
@@ -167,16 +248,24 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.login_id == body.login_id))
     user = result.scalar_one_or_none()
-    if user is None or not verify_password(body.password, user.password_hash):
+    password_matches = verify_password_or_dummy(
+        body.password,
+        user.password_hash if user is not None else None,
+    )
+    if not password_matches:
         await record_audit_event(
             db,
             event_type=AuditEventType.LOGIN_FAILED.value,
             actor_type=AuditActorType.USER.value,
             actor_ref=body.login_id,
             aggregate_type=AuditAggregateType.USER.value,
-            aggregate_id=str(user.id) if user else None,
             # 존재하지 않는 계정인지 비밀번호가 틀린 것인지는 남기지 않는다.
             # 감사 로그가 계정 존재 여부를 알려주는 통로가 되면 안 된다.
+            #
+            # aggregate_id도 비운다. 계정이 있을 때만 채우면 null 여부만으로
+            # 계정 존재가 드러나고 user.id까지 특정되어, payload.reason을
+            # 통일한 의미가 사라진다. 조사에는 actor_ref의 login_id로 충분하다.
+            aggregate_id=None,
             payload={"reason": AuthError.INVALID_CREDENTIALS.value},
         )
         await db.commit()

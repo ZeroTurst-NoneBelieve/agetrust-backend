@@ -178,4 +178,6 @@ def mask_phone(phone: str | None) -> str | None:
     digits = "".join(c for c in phone if c.isdigit())
     if len(digits) <= 4:
         return "*" * len(digits)
+    if len(digits) <= 7:
+        return f"{'*' * (len(digits) - 4)}{digits[-4:]}"
     return f"{digits[:3]}{'*' * (len(digits) - 7)}{digits[-4:]}"
