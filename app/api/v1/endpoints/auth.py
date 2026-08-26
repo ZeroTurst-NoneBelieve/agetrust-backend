@@ -35,7 +35,7 @@ from app.schemas.audit import (
     AuditEventType,
 )
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
-from app.schemas.errors import AuthError
+from app.schemas.errors import AuthError, AuthErrorResponse
 from app.schemas.user import (
     LoginRequest,
     PhoneRequestBody,
@@ -55,8 +55,17 @@ def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
 
 
 # ---------------------------------------------------------------------------
-@router.post("/phone/request", response_model=PhoneRequestResponse)
+@router.post(
+    "/phone/request",
+    response_model=PhoneRequestResponse,
+    summary="전화번호 인증번호 발송",
+)
 async def request_phone_otp(body: PhoneRequestBody, db: AsyncSession = Depends(get_db)):
+    """전화번호로 인증번호를 발송하고 인증 요청 건을 생성한다.
+
+    응답의 verification_id는 이후 phone/verify와 signup 요청에 그대로 전달한다.
+    인증번호는 expires_at까지만 유효하며, 이후에는 재요청이 필요하다.
+    """
     otp = generate_otp()
     from datetime import timedelta
     now = datetime.now(timezone.utc)
@@ -80,8 +89,30 @@ async def request_phone_otp(body: PhoneRequestBody, db: AsyncSession = Depends(g
     )
 
 
-@router.post("/phone/verify", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/phone/verify",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="인증번호 검증",
+    responses={
+        401: {
+            "model": AuthErrorResponse,
+            "description": "인증번호 불일치 / 이미 사용됨 / 만료 / 시도 횟수 초과",
+        },
+        404: {
+            "model": AuthErrorResponse,
+            "description": "해당 인증 요청을 찾을 수 없음",
+        },
+    },
+)
 async def verify_phone_otp(body: PhoneVerifyBody, db: AsyncSession = Depends(get_db)):
+    """인증번호를 검증한다.
+
+    성공 시 본문 없이 204를 반환한다. 인증 건은 이 시점에 소모되지 않으며,
+    signup 요청에서 사용될 때 소모된다.
+
+    실패 사유는 응답 본문의 detail.code로 구분된다.
+    시도 횟수가 상한에 도달하면 이후 요청은 인증번호가 맞아도 거절된다.
+    """
     row = await db.get(PhoneVerificationRequest, body.verification_id)
     if row is None:
         raise _fail(AuthError.OTP_NOT_FOUND, status.HTTP_404_NOT_FOUND)
@@ -120,8 +151,32 @@ async def verify_phone_otp(body: PhoneVerifyBody, db: AsyncSession = Depends(get
     await db.commit()
 
 
-@router.post("/signup", response_model=UserResponse)
+@router.post(
+    "/signup",
+    response_model=UserResponse,
+    summary="회원가입",
+    responses={
+        400: {
+            "model": AuthErrorResponse,
+            "description": "전화번호 미인증 또는 이미 사용된 인증 건",
+        },
+        404: {
+            "model": AuthErrorResponse,
+            "description": "해당 인증 요청을 찾을 수 없음",
+        },
+        409: {
+            "model": AuthErrorResponse,
+            "description": "이미 존재하는 login_id",
+        },
+    },
+)
 async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
+    """전화번호 인증을 마친 건으로 회원가입한다.
+
+    phone/verify를 통과한 verification_id가 필요하며, 해당 인증 건은
+    이 시점에 소모되어 재사용할 수 없다.
+    전화번호는 인증 건에서 가져오므로 요청 본문에 포함하지 않는다.
+    """
     verification = await db.get(PhoneVerificationRequest, body.verification_id)
     if verification is None:
         raise _fail(AuthError.OTP_NOT_FOUND, status.HTTP_404_NOT_FOUND)
@@ -163,8 +218,22 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    summary="로그인",
+    responses={
+        401: {
+            "model": AuthErrorResponse,
+            "description": "아이디 또는 비밀번호가 올바르지 않음",
+        }
+    },
+)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    """로그인하고 액세스·리프레시 토큰을 발급받는다.
+
+    실패 사유는 계정 존재 여부를 드러내지 않도록 하나로 통일한다.
+    """
     result = await db.execute(select(User).where(User.login_id == body.login_id))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(body.password, user.password_hash):
@@ -203,8 +272,23 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.post("/refresh", response_model=TokenResponse)
+@router.post(
+    "/refresh",
+    response_model=TokenResponse,
+    summary="액세스 토큰 재발급",
+    responses={
+        401: {
+            "model": AuthErrorResponse,
+            "description": "리프레시 토큰이 유효하지 않거나 만료됨",
+        }
+    },
+)
 async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
+    """리프레시 토큰으로 액세스·리프레시 토큰을 재발급받는다.
+
+    MVP 범위에서는 리프레시 토큰 블랙리스트를 두지 않으므로,
+    재발급 후에도 이전 리프레시 토큰은 만료 전까지 유효하다.
+    """
     try:
         claims = decode_login_token(body.refresh_token, expected_type="refresh")
     except TokenError as e:
@@ -220,24 +304,44 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="로그아웃",
+)
 async def logout():
+    """로그아웃한다.
+
+    MVP 범위에서는 서버가 토큰을 무효화하지 않으므로, 클라이언트가
+    보관 중인 토큰을 폐기하는 것으로 로그아웃이 완료된다.
+    """
     return None
 
 
-@router.get("/me", response_model=UserResponse)
+@router.get("/me", response_model=UserResponse, summary="내 정보 조회")
 async def me(user: User = Depends(get_current_user)):
+    """액세스 토큰으로 본인 정보를 조회한다."""
     return user
 
 
 # ---------------------------------------------------------------------------
 # 기기 등록
 # ---------------------------------------------------------------------------
-@router.post("/devices", response_model=DeviceResponse)
+@router.post(
+    "/devices",
+    response_model=DeviceResponse,
+    summary="기기 등록",
+)
 async def register_device(
     body: RegisterDeviceRequest, user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """기기를 등록한다.
+
+    응답의 id가 이후 요청의 device_id다.
+    이 시점에는 holder_did가 비어 있으며, VC를 발급받으려면
+    bind-holder-key로 Holder 공개키를 먼저 등록해야 한다.
+    """
     device = Device(user_id=user.id, device_identifier=body.device_identifier,
                     platform=body.platform, status="ACTIVE")
     db.add(device)
@@ -257,11 +361,29 @@ async def register_device(
     return device
 
 
-@router.post("/devices/bind-holder-key", response_model=DeviceResponse)
+@router.post(
+    "/devices/bind-holder-key",
+    response_model=DeviceResponse,
+    summary="Holder 공개키 바인딩",
+    responses={
+        400: {"description": "소유 증명 서명 검증 실패"},
+        404: {"description": "기기를 찾을 수 없거나 본인 소유가 아님"},
+    },
+)
 async def bind_holder_key(
     body: BindHolderKeyRequest, user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """기기에 Holder 공개키를 등록하고 did:key를 파생한다.
+
+    공개키만 받는 것이 아니라, 대응하는 개인키를 실제로 보유하고 있는지
+    서명으로 검증한다. 서명 대상은 device_id를 10진 문자열로 바꾼 바이트열이다.
+    (예: device_id가 15이면 "15"의 UTF-8 바이트에 서명)
+
+    재바인딩이 허용되며, holder_did가 실제로 바뀌는 경우 해당 기기로 발급된
+    ACTIVE 상태 VC는 REVOKED로 전이된다. 동일 키를 다시 바인딩하는 경우에는
+    소유자가 그대로이므로 폐기하지 않는다.
+    """
     device = await db.get(Device, body.device_id)
     if device is None or device.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
@@ -321,7 +443,12 @@ async def bind_holder_key(
     return device
 
 
-@router.get("/devices", response_model=list[DeviceResponse])
+@router.get(
+    "/devices",
+    response_model=list[DeviceResponse],
+    summary="내 기기 목록 조회",
+)
 async def list_my_devices(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """본인이 등록한 기기 목록을 조회한다."""
     result = await db.execute(select(Device).where(Device.user_id == user.id))
     return result.scalars().all()

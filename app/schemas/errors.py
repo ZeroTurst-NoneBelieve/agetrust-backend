@@ -2,6 +2,8 @@
 
 from enum import StrEnum
 
+from pydantic import BaseModel, Field
+
 
 class AuthError(StrEnum):
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
@@ -22,12 +24,30 @@ class AuthError(StrEnum):
     KIOSK_INACTIVE = "KIOSK_INACTIVE"
 
 
+class AuthErrorDetail(BaseModel):
+    """인증·인가 오류 상세."""
+
+    code: AuthError = Field(description="클라이언트가 분기할 수 있는 오류 코드.")
+
+
+class AuthErrorResponse(BaseModel):
+    """FastAPI HTTPException의 인증·인가 오류 응답."""
+
+    detail: AuthErrorDetail
+
+
 class AdultVerificationStatus(StrEnum):
     SUCCESS = "SUCCESS"
     FAIL_AGE = "FAIL_AGE"
     FAIL_FACE_MISMATCH = "FAIL_FACE_MISMATCH"
     FAIL_LIVENESS = "FAIL_LIVENESS"
     ERROR = "ERROR"
+
+
+class AdultVerificationFailureCode(StrEnum):
+    AGE_POLICY_FAILED = "AGE_POLICY_FAILED"
+    ID_SELFIE_MISMATCH = "ID_SELFIE_MISMATCH"
+    LIVENESS_FAILED = "LIVENESS_FAILED"
 
 
 class VerificationResultStatus(StrEnum):
