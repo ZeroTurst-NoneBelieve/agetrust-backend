@@ -11,7 +11,6 @@ from app.models.store import Store
 from app.models.user import User
 from app.models.user_consent import UserConsent
 from app.models.vc_credential import VcCredential
-from app.models.verification_challenge import VerificationChallenge
 from app.models.verification_log import VerificationLog
 
 __all__ = [
@@ -28,6 +27,5 @@ __all__ = [
     "User",
     "UserConsent",
     "VcCredential",
-    "VerificationChallenge",
     "VerificationLog",
 ]
