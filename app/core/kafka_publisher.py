@@ -26,13 +26,28 @@ audit_logs를 Kafka 하류의 조회용 Projection으로 본다. 이 구현은 �
 
 그래서 여기서는 audit_logs를 만들지 않고, 이미 기록된 원장에 **그 이벤트가
 Kafka 어디에 실렸는지**(topic/partition/offset)만 되채운다.
+
+## 전송 보장은 at-least-once다 (exactly-once가 아니다)
+
+Kafka 전송과 `published_at` 커밋은 서로 다른 시스템이라 원자적으로 묶을 수
+없다. 전송이 성공한 뒤 커밋 전에 프로세스가 죽으면, 재기동 시 그 이벤트는
+여전히 미발행으로 보여 **같은 event_id가 다시 발행된다.**
+
+`enable_idempotence=True`는 한 프로듀서 세션 안의 재시도 중복만 막는다.
+프로세스 재기동을 건너뛰는 중복은 막지 못한다.
+
+따라서 **구독자는 `event_id`로 중복을 걸러야 한다.** 메시지에 `event_id`를
+넣는 이유가 이것이다. 반대 방향(이벤트 유실)은 일어나지 않는다. 커밋되지
+않으면 다음 주기에 다시 집어가기 때문이다.
+
+감사 이벤트에서는 이 선택이 맞다. 유실보다 중복이 낫다.
 """
 
 import asyncio
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -138,6 +153,22 @@ async def _backfill_kafka_position(db: AsyncSession, event_id, metadata) -> None
         )
 
 
+async def count_exhausted(db: AsyncSession) -> int:
+    """재시도 한도를 넘겨 더 이상 발행되지 않는 이벤트 수.
+
+    이 이벤트들은 `_claim_pending`의 조회 대상에서 빠지므로, 세지 않으면
+    존재 자체가 보이지 않는다.
+    """
+    return await db.scalar(
+        select(func.count())
+        .select_from(OutboxEvent)
+        .where(
+            OutboxEvent.published_at.is_(None),
+            OutboxEvent.retry_count >= settings.outbox_max_retry_count,
+        )
+    )
+
+
 async def publish_pending_once(db: AsyncSession, producer) -> int:
     """미발행 이벤트를 한 배치 발행하고, 발행한 건수를 돌려준다.
 
@@ -145,6 +176,15 @@ async def publish_pending_once(db: AsyncSession, producer) -> int:
     브로커가 죽어 있으면 나머지도 어차피 실패하므로 배치를 중단하고, 프로듀서를
     새로 만들 기회를 루프에 넘긴다. 실패를 여기서 삼키면 못 쓰게 된 프로듀서로
     영원히 재시도하게 된다.
+
+    ## 실패가 곧바로 돌아오지는 않는다
+
+    aiokafka는 `send_and_wait` 안에서 자체적으로 재연결·재시도를 하다가
+    타임아웃에 도달해야 예외를 던진다. 브로커를 끊어도 이 함수는 수십 초
+    블로킹된 뒤에야 실패한다.
+
+    그래서 `retry_count`는 폴링 주기가 아니라 aiokafka의 타임아웃 간격으로
+    올라간다. `outbox_max_retry_count`를 몇 초 만에 소진하는 일은 없다.
     """
     events = await _claim_pending(db, settings.outbox_publish_batch_size)
     if not events:
@@ -164,14 +204,28 @@ async def publish_pending_once(db: AsyncSession, producer) -> int:
             # retry_count는 server_default라 아직 DB를 거치지 않은 행에서는
             # None일 수 있다.
             event.retry_count = (event.retry_count or 0) + 1
-            # 브로커 장애는 재시도로 해결되는 정상 경로다. 매 주기 traceback을
-            # 남기면 로그가 묻히므로 예외 타입·메시지만 남긴다.
-            logger.warning(
-                "outbox 이벤트 발행 실패 (event_id=%s, retry_count=%d): %r",
-                event.event_id,
-                event.retry_count,
-                error,
-            )
+
+            if event.retry_count >= settings.outbox_max_retry_count:
+                # 한도를 넘기면 이후 조회 대상에서 빠져 조용히 사라진다.
+                # 사라지는 순간만큼은 반드시 눈에 띄어야 한다.
+                logger.error(
+                    "outbox 이벤트가 재시도 한도(%d)에 도달해 더 이상 발행되지 않는다. "
+                    "감사 원장(audit_logs)에는 남아 있지만 Kafka 구독자에게는 전달되지 "
+                    "않으므로 수동 조치가 필요하다. (event_id=%s, event_type=%s): %r",
+                    settings.outbox_max_retry_count,
+                    event.event_id,
+                    event.event_type,
+                    error,
+                )
+            else:
+                # 브로커 장애는 재시도로 해결되는 정상 경로다. 매 주기 traceback을
+                # 남기면 로그가 묻히므로 예외 타입·메시지만 남긴다.
+                logger.warning(
+                    "outbox 이벤트 발행 실패 (event_id=%s, retry_count=%d): %r",
+                    event.event_id,
+                    event.retry_count,
+                    error,
+                )
             failure = error
             break
 
@@ -198,6 +252,28 @@ async def _wait(stop_event: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         pass
+
+
+async def _report_exhausted(session_factory) -> None:
+    """포기된 이벤트가 쌓여 있으면 알린다.
+
+    한도를 넘긴 이벤트는 조회 대상에서 빠지므로 가만히 두면 아무도 모른다.
+    프로듀서를 새로 연결할 때마다 현황을 남겨 최소한의 가시성을 확보한다.
+    """
+    try:
+        async with session_factory() as db:
+            stuck = await count_exhausted(db)
+    except Exception:
+        # 현황 보고 실패가 발행을 막아서는 안 된다.
+        logger.warning("포기된 outbox 이벤트 수를 세지 못했다.", exc_info=True)
+        return
+
+    if stuck:
+        logger.error(
+            "재시도 한도를 넘겨 발행되지 않은 outbox 이벤트가 %d건 있다. "
+            "감사 원장에는 남아 있으나 Kafka 구독자에게는 전달되지 않았다.",
+            stuck,
+        )
 
 
 def _new_producer():
@@ -252,6 +328,8 @@ async def run_publisher_loop(
             continue
 
         logger.info("Kafka Publisher 시작 (topic=%s)", settings.kafka_audit_topic)
+        await _report_exhausted(session_factory)
+
         try:
             while not stop_event.is_set():
                 async with session_factory() as db:

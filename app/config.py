@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     outbox_publish_batch_size: int = 100
     # 이 횟수를 넘기면 해당 이벤트는 건너뛴다. 깨진 이벤트 하나가 뒤의 정상
     # 이벤트를 영원히 막지 않도록 하기 위한 것이다.
+    # 한도에 도달하면 ERROR 로그가 남는다. 감사 원장(audit_logs)에는 그대로
+    # 남아 있고 Kafka 구독자에게만 전달되지 않는다.
     outbox_max_retry_count: int = 10
     # 로컬에서 Kafka 없이 API만 띄우고 싶을 때 끈다.
     kafka_publisher_enabled: bool = True

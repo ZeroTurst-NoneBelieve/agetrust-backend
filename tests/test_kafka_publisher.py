@@ -22,6 +22,7 @@ from app.config import settings  # noqa: E402
 from app.core.kafka_publisher import (  # noqa: E402
     PublishFailed,
     build_message,
+    count_exhausted,
     partition_key,
     publish_pending_once,
     run_publisher_loop,
@@ -226,6 +227,46 @@ class PublishFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(events[0].published_at, "성공한 발행이 취소됐다")
         self.assertIsNone(events[1].published_at)
         self.assertEqual(events[1].retry_count, 1)
+
+
+class RetryExhaustionTests(unittest.IsolatedAsyncioTestCase):
+    """재시도 한도를 넘긴 이벤트가 조용히 사라지면 안 된다.
+
+    한도를 넘기면 _claim_pending의 WHERE에서 빠져 다시는 조회되지 않는다.
+    사라지는 순간과 누적 현황이 모두 눈에 띄어야 한다.
+    """
+
+    async def test_reaching_the_ceiling_logs_an_error(self):
+        event = _event(retry_count=settings.outbox_max_retry_count - 1)
+        db = FakeOutboxDb([event])
+        producer = FakeProducer(fail_with=ConnectionError("broker down"))
+
+        with self.assertLogs("app.core.kafka_publisher", level="ERROR") as captured:
+            with self.assertRaises(PublishFailed):
+                await publish_pending_once(db, producer)
+
+        joined = "\n".join(captured.output)
+        self.assertIn(str(event.event_id), joined)
+        self.assertIn("재시도 한도", joined)
+
+    async def test_below_the_ceiling_stays_a_warning(self):
+        """아직 재시도 여지가 있는 실패까지 ERROR로 올리면 진짜 신호가 묻힌다."""
+        event = _event(retry_count=0)
+        db = FakeOutboxDb([event])
+        producer = FakeProducer(fail_with=ConnectionError("broker down"))
+
+        with self.assertLogs("app.core.kafka_publisher", level="WARNING") as captured:
+            with self.assertRaises(PublishFailed):
+                await publish_pending_once(db, producer)
+
+        self.assertFalse(
+            [line for line in captured.output if line.startswith("ERROR")],
+            "한도에 도달하지 않았는데 ERROR가 났다",
+        )
+
+    async def test_exhausted_events_are_counted(self):
+        db = FakeOutboxDb(exhausted_count=3)
+        self.assertEqual(await count_exhausted(db), 3)
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):

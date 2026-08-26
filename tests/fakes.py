@@ -150,7 +150,7 @@ class FakeOutboxDb:
     - `backfills` : audit_logs에 Kafka 좌표를 되채운 UPDATE 문
     """
 
-    def __init__(self, pending=None, *, backfill_error=None):
+    def __init__(self, pending=None, *, backfill_error=None, exhausted_count=0):
         self.pending = list(pending or [])
         self.backfills = []
         self.commits = 0
@@ -158,6 +158,11 @@ class FakeOutboxDb:
         self.savepoints = 0
         # 좌표 기록이 유니크 제약에 걸리는 상황을 재현하기 위한 것.
         self.backfill_error = backfill_error
+        # count_exhausted()가 돌려줄 값.
+        self.exhausted_count = exhausted_count
+
+    async def scalar(self, statement):
+        return self.exhausted_count
 
     async def execute(self, statement, params=None):
         text = str(statement)
