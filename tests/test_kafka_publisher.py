@@ -4,6 +4,7 @@ DB와 Kafka 없이 도는 단위 테스트다. 발행 성공/실패 시 outbox �
 바뀌는지, 원장(audit_logs)에 Kafka 좌표가 되채워지는지를 확인한다.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -19,9 +20,11 @@ from sqlalchemy.exc import IntegrityError  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.core.kafka_publisher import (  # noqa: E402
+    PublishFailed,
     build_message,
     partition_key,
     publish_pending_once,
+    run_publisher_loop,
 )
 from app.models import OutboxEvent  # noqa: E402
 from tests.fakes import FakeOutboxDb, FakeProducer  # noqa: E402
@@ -157,38 +160,43 @@ class BackfillFailureTests(unittest.IsolatedAsyncioTestCase):
 class PublishFailureTests(unittest.IsolatedAsyncioTestCase):
     """브로커가 죽었을 때 이벤트를 잃지 않는지 확인한다."""
 
+    @staticmethod
+    def _broken():
+        return FakeProducer(fail_with=ConnectionError("broker down"))
+
+    async def _publish_expecting_failure(self, db, producer):
+        """전송 실패는 PublishFailed로 올라온다."""
+        with self.assertRaises(PublishFailed):
+            await publish_pending_once(db, producer)
+
+    async def test_failure_raises_publish_failed(self):
+        """실패를 삼키면 못 쓰게 된 프로듀서로 영원히 재시도하게 된다.
+
+        루프가 프로듀서를 새로 만들 수 있도록 예외가 올라와야 한다.
+        """
+        await self._publish_expecting_failure(FakeOutboxDb([_event()]), self._broken())
+
     async def test_failure_increments_retry_count(self):
         events = [_event(index=0)]
-        db = FakeOutboxDb(events)
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        self.assertEqual(await publish_pending_once(db, producer), 0)
+        await self._publish_expecting_failure(FakeOutboxDb(events), self._broken())
         self.assertEqual(events[0].retry_count, 1)
 
     async def test_failure_leaves_event_unpublished(self):
         """published_at이 남으면 이벤트가 영영 발행되지 않고 유실된다."""
         events = [_event(index=0)]
-        db = FakeOutboxDb(events)
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        await publish_pending_once(db, producer)
+        await self._publish_expecting_failure(FakeOutboxDb(events), self._broken())
         self.assertIsNone(events[0].published_at)
 
-    async def test_failure_is_committed(self):
-        """롤백하면 retry_count가 남지 않아 같은 이벤트를 영원히 재시도한다."""
+    async def test_failure_is_committed_before_raising(self):
+        """예외 전에 커밋하지 않으면 retry_count가 남지 않아 무한 재시도가 된다."""
         db = FakeOutboxDb([_event()])
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        await publish_pending_once(db, producer)
+        await self._publish_expecting_failure(db, self._broken())
         self.assertEqual(db.commits, 1)
 
     async def test_failure_stops_the_batch(self):
         """브로커가 죽었으면 나머지도 실패한다. 배치 전체를 낭비하지 않는다."""
         events = [_event(index=i) for i in range(5)]
-        db = FakeOutboxDb(events)
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        await publish_pending_once(db, producer)
+        await self._publish_expecting_failure(FakeOutboxDb(events), self._broken())
 
         self.assertEqual(events[0].retry_count, 1)
         # 뒤 이벤트는 시도조차 하지 않았어야 한다.
@@ -198,19 +206,95 @@ class PublishFailureTests(unittest.IsolatedAsyncioTestCase):
         """server_default라 DB를 거치지 않은 행은 retry_count가 None이다."""
         event = _event()
         event.retry_count = None
-        db = FakeOutboxDb([event])
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        await publish_pending_once(db, producer)
+        await self._publish_expecting_failure(FakeOutboxDb([event]), self._broken())
         self.assertEqual(event.retry_count, 1)
 
     async def test_no_backfill_when_publish_failed(self):
         """발행되지 않은 이벤트의 Kafka 좌표를 원장에 적으면 거짓말이 된다."""
         db = FakeOutboxDb([_event()])
-        producer = FakeProducer(fail_with=ConnectionError("broker down"))
-
-        await publish_pending_once(db, producer)
+        await self._publish_expecting_failure(db, self._broken())
         self.assertEqual(db.backfills, [])
+
+    async def test_partial_batch_keeps_what_succeeded(self):
+        """앞에서 성공한 발행은 뒤의 실패에 끌려가면 안 된다."""
+        events = [_event(index=0), _event(index=1)]
+        db = FakeOutboxDb(events)
+        producer = FakeProducer(fail_after=1, fail_with=ConnectionError("broker down"))
+
+        await self._publish_expecting_failure(db, producer)
+
+        self.assertIsNotNone(events[0].published_at, "성공한 발행이 취소됐다")
+        self.assertIsNone(events[1].published_at)
+        self.assertEqual(events[1].retry_count, 1)
+
+
+class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    """전송 실패 후 프로듀서를 새로 만드는지 확인한다.
+
+    실패를 publish_pending_once 안에서 삼키면 이 경로는 Kafka 오류로는
+    절대 실행되지 않는다. 그러면 브로커가 잠깐 죽었다 살아나도 못 쓰게 된
+    프로듀서를 계속 붙들고 있어 영영 복구되지 않는다.
+    """
+
+    def _run_loop_with(self, producers, pending_per_cycle):
+        """프로듀서를 순서대로 갈아끼우며 루프를 돌린다."""
+        stop_event = asyncio.Event()
+        made = []
+        cycles = {"n": 0}
+
+        def factory():
+            producer = producers[min(len(made), len(producers) - 1)]
+            made.append(producer)
+            return producer
+
+        def session_factory():
+            cycles["n"] += 1
+            # 정해진 횟수만 돌고 루프를 세운다. 테스트가 무한히 돌면 안 된다.
+            if cycles["n"] > len(pending_per_cycle):
+                stop_event.set()
+                return _NullSession()
+            return _NullSession(pending_per_cycle[cycles["n"] - 1])
+
+        return stop_event, made, factory, session_factory
+
+    async def test_producer_is_recreated_after_send_failure(self):
+        broken = FakeProducer(fail_with=ConnectionError("broker down"))
+        healthy = FakeProducer()
+        stop_event, made, factory, session_factory = self._run_loop_with(
+            [broken, healthy], [[_event(index=0)], [_event(index=1)]]
+        )
+
+        await run_publisher_loop(session_factory, stop_event, producer_factory=factory)
+
+        self.assertGreaterEqual(
+            len(made), 2, "전송 실패 후에도 같은 프로듀서를 계속 썼다"
+        )
+        self.assertIs(made[0], broken)
+        self.assertIs(made[1], healthy)
+
+    async def test_broken_producer_is_stopped(self):
+        """버리는 프로듀서는 닫아야 소켓이 샌다."""
+        broken = FakeProducer(fail_with=ConnectionError("broker down"))
+        healthy = FakeProducer()
+        stop_event, _, factory, session_factory = self._run_loop_with(
+            [broken, healthy], [[_event(index=0)]]
+        )
+
+        await run_publisher_loop(session_factory, stop_event, producer_factory=factory)
+        self.assertTrue(broken.stopped, "실패한 프로듀서를 닫지 않았다")
+
+
+class _NullSession:
+    """run_publisher_loop이 쓰는 `async with session_factory()` 대역."""
+
+    def __init__(self, pending=None):
+        self._db = FakeOutboxDb(pending)
+
+    async def __aenter__(self):
+        return self._db
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 if __name__ == "__main__":

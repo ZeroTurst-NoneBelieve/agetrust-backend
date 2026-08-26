@@ -118,14 +118,24 @@ class FakeProducer:
     동작을 검증하기 위한 것이다.
     """
 
-    def __init__(self, *, fail_with=None, topic="agetrust.audit-events"):
+    def __init__(self, *, fail_with=None, fail_after=0, topic="agetrust.audit-events"):
         self.sent = []
         self.fail_with = fail_with
+        # 앞의 몇 건은 성공시킨 뒤 실패시킨다. 배치 중간에 브로커가 죽는 상황.
+        self.fail_after = fail_after
         self.topic = topic
+        self.started = False
+        self.stopped = False
         self._offset = 0
 
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
     async def send_and_wait(self, topic, *, value, key):
-        if self.fail_with is not None:
+        if self.fail_with is not None and len(self.sent) >= self.fail_after:
             raise self.fail_with
         self.sent.append({"topic": topic, "key": key, "value": value})
         metadata = FakeRecordMetadata(topic, 0, self._offset)

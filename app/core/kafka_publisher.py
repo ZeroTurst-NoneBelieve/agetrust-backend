@@ -43,6 +43,17 @@ from app.models import AuditLog, OutboxEvent
 logger = logging.getLogger(__name__)
 
 
+class PublishFailed(Exception):
+    """전송 실패로 배치를 중단했음을 루프에 알린다.
+
+    프로듀서가 한 번 못 쓰는 상태가 되면(브로커 다운, 연결 종료, 멱등 프로듀서의
+    ProducerFenced 등) 같은 인스턴스로 다시 보내도 계속 실패한다. 그래서 실패를
+    안에서 삼키지 않고 밖으로 올려, 루프가 프로듀서를 새로 만들도록 한다.
+
+    이 예외가 올라오기 전에 retry_count는 이미 커밋된다.
+    """
+
+
 def build_message(event: OutboxEvent) -> bytes:
     """Kafka로 보낼 이벤트 본문.
 
@@ -130,15 +141,18 @@ async def _backfill_kafka_position(db: AsyncSession, event_id, metadata) -> None
 async def publish_pending_once(db: AsyncSession, producer) -> int:
     """미발행 이벤트를 한 배치 발행하고, 발행한 건수를 돌려준다.
 
-    전송에 실패하면 `retry_count`만 올리고 배치를 중단한다. 브로커가 죽어
-    있으면 나머지도 어차피 실패할 텐데, 배치 전체를 타임아웃으로 흘려보내면
-    한 주기가 통째로 낭비되기 때문이다. 다음 주기에 다시 집어간다.
+    전송에 실패하면 `retry_count`를 올려 커밋한 뒤 `PublishFailed`를 올린다.
+    브로커가 죽어 있으면 나머지도 어차피 실패하므로 배치를 중단하고, 프로듀서를
+    새로 만들 기회를 루프에 넘긴다. 실패를 여기서 삼키면 못 쓰게 된 프로듀서로
+    영원히 재시도하게 된다.
     """
     events = await _claim_pending(db, settings.outbox_publish_batch_size)
     if not events:
         return 0
 
     published = 0
+    failure: Exception | None = None
+
     for event in events:
         try:
             metadata = await producer.send_and_wait(
@@ -158,6 +172,7 @@ async def publish_pending_once(db: AsyncSession, producer) -> int:
                 event.retry_count,
                 error,
             )
+            failure = error
             break
 
         event.published_at = datetime.now(timezone.utc)
@@ -166,7 +181,14 @@ async def publish_pending_once(db: AsyncSession, producer) -> int:
 
     # 성공한 published_at과 실패한 retry_count를 함께 커밋한다.
     # 여기서 롤백하면 실패 횟수가 남지 않아 같은 이벤트를 영원히 재시도한다.
+    # 예외를 올리기 전에 반드시 커밋해야 한다.
     await db.commit()
+
+    if failure is not None:
+        raise PublishFailed(
+            f"Kafka 전송 실패로 배치를 중단했다 (발행 {published}건): {failure!r}"
+        ) from failure
+
     return published
 
 
@@ -178,23 +200,44 @@ async def _wait(stop_event: asyncio.Event, seconds: float) -> None:
         pass
 
 
-async def run_publisher_loop(session_factory, stop_event: asyncio.Event) -> None:
+def _new_producer():
+    """기본 프로듀서 팩토리.
+
+    aiokafka는 여기서만 import한다. Publisher를 끈 채로도(또는 테스트에서)
+    앱이 뜰 수 있어야 하기 때문이다.
+    """
+    from aiokafka import AIOKafkaProducer
+
+    return AIOKafkaProducer(
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        # 한 세션 안의 재시도 중복을 브로커 단에서도 막는다.
+        # (프로세스 재기동을 건너뛰는 중복은 막지 못한다 — 모듈 docstring 참고)
+        acks="all",
+        enable_idempotence=True,
+    )
+
+
+async def run_publisher_loop(
+    session_factory,
+    stop_event: asyncio.Event,
+    producer_factory=None,
+) -> None:
     """앱이 사는 동안 미발행 이벤트를 계속 Kafka로 흘려보낸다.
 
     Kafka가 아직 안 떴거나 도중에 죽어도 루프는 살아남는다. 감사 이벤트는
     outbox에 안전하게 쌓여 있으므로 브로커가 돌아오면 밀린 만큼 따라잡는다.
-    """
-    from aiokafka import AIOKafkaProducer
 
+    전송이 실패하면(`PublishFailed`) 프로듀서를 버리고 바깥 루프에서 새로
+    만든다. 한 번 못 쓰게 된 프로듀서를 계속 붙들고 있으면 브로커가 돌아와도
+    영영 복구되지 않는다.
+
+    `producer_factory`는 테스트에서 프로듀서를 갈아끼우기 위한 것이다.
+    """
+    make_producer = producer_factory or _new_producer
     interval = settings.outbox_poll_interval_seconds
 
     while not stop_event.is_set():
-        producer = AIOKafkaProducer(
-            bootstrap_servers=settings.kafka_bootstrap_servers,
-            # 중복 발행을 브로커 단에서도 막는다.
-            acks="all",
-            enable_idempotence=True,
-        )
+        producer = make_producer()
         try:
             await producer.start()
         except Exception as error:
@@ -217,6 +260,12 @@ async def run_publisher_loop(session_factory, stop_event: asyncio.Event) -> None
                 await _wait(stop_event, 0 if published else interval)
         except asyncio.CancelledError:
             raise
+        except PublishFailed as error:
+            # 실패 내용은 publish_pending_once에서 이미 남겼다. 여기서는 프로듀서를
+            # 버리고 바깥 루프로 나가 새로 만든다. 못 쓰게 된 프로듀서를 계속
+            # 붙들고 있으면 브로커가 돌아와도 영영 복구되지 않는다.
+            logger.warning("프로듀서를 새로 만들어 재연결한다: %s", error)
+            await _wait(stop_event, interval)
         except Exception:
             logger.exception("Publisher 루프가 중단됐다. 재연결한다.")
             await _wait(stop_event, interval)
