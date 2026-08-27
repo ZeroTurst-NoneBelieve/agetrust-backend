@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -18,13 +19,13 @@ class PhoneRequestResponse(BaseModel):
 
 
 class PhoneVerifyBody(BaseModel):
-    verification_id: str
+    verification_id: UUID
     otp: str
 
 
 class SignupRequest(BaseModel):
-    verification_id: str
-    login_id: str = Field(examples=["gayeon123"])
+    verification_id: UUID
+    login_id: str = Field(min_length=1, max_length=100, examples=["gayeon123"])
     password: str = Field(min_length=8)
     name: str = Field(examples=["이가연"])
 
@@ -40,7 +41,7 @@ class UserResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    login_id: str
+    login_id: str = Field(min_length=1, max_length=100)
     password: str
 
 
