@@ -13,6 +13,13 @@ from app.config import settings
 from app.schemas.errors import AuthError
 
 
+# 존재하지 않는 계정도 실제 계정과 같은 bcrypt 비용을 지불하게 하는 더미 해시.
+# 로그인 응답 시간으로 계정 존재 여부를 추측하는 것을 어렵게 한다.
+_DUMMY_PASSWORD_HASH = (
+    "$2b$12$IBLySYLPC6ErRySTOEW.Ve.uFNIZxFstN/FgidkOcgAnha65tBWPS"
+)
+
+
 class TokenError(Exception):
     def __init__(self, code: AuthError):
         self.code = code
@@ -28,6 +35,12 @@ def verify_password(plain: str, hashed: str) -> bool:
         return bcrypt.checkpw(plain.encode("utf-8")[:72], hashed.encode("utf-8"))
     except ValueError:
         return False
+
+
+def verify_password_or_dummy(plain: str, hashed: str | None) -> bool:
+    """계정 존재 여부와 무관하게 bcrypt 검증을 정확히 한 번 수행한다."""
+    password_matches = verify_password(plain, hashed or _DUMMY_PASSWORD_HASH)
+    return hashed is not None and password_matches
 
 
 def _create_login_token(subject: int, token_type: str, expires: timedelta,

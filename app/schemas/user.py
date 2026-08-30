@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -37,7 +38,7 @@ class PhoneRequestResponse(BaseModel):
 class PhoneVerifyBody(BaseModel):
     """인증번호 검증 요청."""
 
-    verification_id: str = Field(
+    verification_id: UUID = Field(
         description="phone/request 응답에서 받은 인증 요청 식별자.",
         examples=["9d65e6a3-3f06-4ce2-9928-7359667a9577"],
     )
@@ -54,11 +55,16 @@ class SignupRequest(BaseModel):
     해당 인증 건은 가입 시 소모되어 재사용할 수 없다.
     """
 
-    verification_id: str = Field(
+    verification_id: UUID = Field(
         description="phone/verify를 통과한 인증 요청 식별자.",
         examples=["9d65e6a3-3f06-4ce2-9928-7359667a9577"],
     )
-    login_id: str = Field(examples=["gayeon123"], description="로그인 아이디.")
+    login_id: str = Field(
+        min_length=1,
+        max_length=100,
+        examples=["gayeon123"],
+        description="로그인 아이디.",
+    )
     password: str = Field(min_length=8, description="비밀번호. 최소 8자.")
     name: str = Field(examples=["이가연"], description="사용자 이름.")
 
@@ -81,7 +87,12 @@ class UserResponse(BaseModel):
 class LoginRequest(BaseModel):
     """로그인 요청."""
 
-    login_id: str = Field(examples=["gayeon123"], description="로그인 아이디.")
+    login_id: str = Field(
+        min_length=1,
+        max_length=100,
+        examples=["gayeon123"],
+        description="로그인 아이디.",
+    )
     password: str = Field(description="비밀번호.")
 
 
