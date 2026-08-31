@@ -23,11 +23,28 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Set it in .env}
       ISSUER_PRIVATE_KEY: ${ISSUER_PRIVATE_KEY:?ISSUER_PRIVATE_KEY is required. Set it in .env}
+      # .env는 컨테이너 안으로 들어가지 않는다. docker compose가 ${} 치환에만
+      # 쓰기 때문이다. 그래서 앱이 읽어야 하는 값은 여기에 전부 나열해야 한다.
+      # 하나라도 빠지면 .env에 적어도 조용히 무시되고 코드 기본값이 쓰인다.
+      # 전부 시크릿이 아니라 환경마다 달라지는 값이라 기본값을 둔다.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
+      KAFKA_AUDIT_TOPIC: ${KAFKA_AUDIT_TOPIC:-agetrust.audit-events}
+      KAFKA_PUBLISHER_ENABLED: ${KAFKA_PUBLISHER_ENABLED:-true}
+      OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS:-2.0}
+      OUTBOX_PUBLISH_BATCH_SIZE: ${OUTBOX_PUBLISH_BATCH_SIZE:-100}
+      OUTBOX_MAX_RETRY_COUNT: ${OUTBOX_MAX_RETRY_COUNT:-10}
+      # 기본값 false를 유지한다(#24). 여기 없으면 .env에 DEV_MODE=true를 적어도
+      # 조용히 무시되어, 문서대로 했는데 안 켜지는 상태가 된다.
+      DEV_MODE: ${DEV_MODE:-false}
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
+      # Kafka는 healthy까지 기다리지 않는다. Publisher가 브로커 없음을 견디고
+      # 재시도하도록 만들었으므로, Kafka가 늦게 떠도 API는 즉시 뜨는 편이 낫다.
+      kafka:
+        condition: service_started
     volumes:
       - ./app:/app/app
       - ./alembic:/app/alembic
@@ -44,12 +61,23 @@ services:
     container_name: agetrust-kafka
     depends_on:
       - zookeeper
+    # 컨테이너를 다시 만들면 Zookeeper에 직전 broker 등록(ephemeral node)이
+    # 아직 남아 있어 "node already exists"로 기동에 실패할 수 있다. 옛 세션은
+    # 수십 초 안에 만료되므로, 한 번 죽어도 알아서 다시 뜨게 둔다.
+    restart: on-failure
     ports:
       - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      # 리스너를 둘로 나눈다. 컨테이너끼리는 kafka:29092, 호스트(노트북)에서
+      # 접속할 때는 localhost:9092 를 쓴다. 하나로 합치면 둘 중 한쪽이 반드시
+      # 깨진다 — Kafka는 접속해온 클라이언트에게 "이 주소로 다시 붙어라"라고
+      # 알려주는데, 그 주소가 localhost면 backend 컨테이너는 자기 자신을 찾는다.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
 volumes:
