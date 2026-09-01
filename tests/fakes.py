@@ -269,4 +269,3 @@ class _FakeSavepoint:
     async def __aexit__(self, exc_type, exc, tb):
         # 롤백만 하고 예외는 삼키지 않는다 (실제 SAVEPOINT와 같은 동작).
         return False
-    
