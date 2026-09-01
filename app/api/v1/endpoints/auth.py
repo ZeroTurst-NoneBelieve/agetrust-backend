@@ -10,13 +10,14 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
+from app.core.revocation import revoke_active_credentials_for_device
 from app.core.security import (
     TokenError,
     create_access_token,
@@ -29,7 +30,7 @@ from app.core.security import (
     verify_password_or_dummy,
 )
 from app.database import get_db
-from app.models import Device, PhoneVerificationRequest, User, VcCredential
+from app.models import Device, PhoneVerificationRequest, User
 from app.schemas.audit import (
     AuditActorType,
     AuditAggregateType,
@@ -467,8 +468,9 @@ async def bind_holder_key(
     (예: device_id가 15이면 "15"의 UTF-8 바이트에 서명)
 
     재바인딩이 허용되며, holder_did가 실제로 바뀌는 경우 해당 기기로 발급된
-    ACTIVE 상태 VC는 REVOKED로 전이된다. 동일 키를 다시 바인딩하는 경우에는
-    소유자가 그대로이므로 폐기하지 않는다.
+    ACTIVE 상태 VC는 REVOKED로 전이되고, StatusList2021 폐기 목록의 해당
+    비트도 함께 켜진다. 동일 키를 다시 바인딩하는 경우에는 소유자가
+    그대로이므로 폐기하지 않는다.
     """
     device = await db.get(Device, body.device_id)
     if device is None or device.user_id != user.id:
@@ -485,21 +487,17 @@ async def bind_holder_key(
     previous_holder_did = device.holder_did
     is_rebinding = previous_holder_did is not None and previous_holder_did != new_holder_did
     revoked_count = 0
+    revoked_bit_count = 0
 
     # 재바인딩으로 holder_did가 바뀌면, 이전 DID로 발급된 VC는 더 이상
     # 이 기기의 현재 소유자를 가리키지 않는다. did:key는 자기완결적이라
-    # 키오스크가 서버를 조회하지 않으므로, 최소한 서버 DB에 폐기 사실을 남긴다.
-    # (실제 차단은 폐기 목록 동기화가 구현되어야 완성된다 — #22 참고)
+    # 키오스크가 서버를 조회하지 않으므로, 서버 DB의 폐기만으로는 분실 기기의
+    # VC가 만료 전까지 통과한다(#22에서 남겨둔 요구사항).
+    # 이제 StatusList2021 비트까지 함께 켜서 키오스크도 거부하게 한다(#27).
     if is_rebinding:
-        result = await db.execute(
-            update(VcCredential)
-            .where(
-                VcCredential.device_id == device.id,
-                VcCredential.status == "ACTIVE",
-            )
-            .values(status="REVOKED", revoked_at=datetime.now(timezone.utc))
+        revoked_count, revoked_bit_count = await revoke_active_credentials_for_device(
+            db, device.id
         )
-        revoked_count = result.rowcount or 0
 
     device.holder_did = new_holder_did
     device.holder_public_key = body.holder_public_key_pem
@@ -521,6 +519,9 @@ async def bind_holder_key(
             "previous_holder_did": previous_holder_did,
             "new_holder_did": new_holder_did,
             "revoked_vc_count": revoked_count,
+            # 폐기 목록에 실제로 반영된 수. revoked_vc_count와 다르면 상태
+            # 목록 배정이 없는 옛 VC가 섞여 있다는 뜻이다.
+            "revoked_status_list_bits": revoked_bit_count,
         },
     )
 

@@ -39,15 +39,25 @@ class FakeDb:
 
     - `scalar_results` : {모델: 돌려줄 값}. select(Model) 형태의 조회에 쓴다.
     - `scalar_default` : 위에 걸리지 않는 집계 쿼리(MAX+1 등)의 반환값.
+    - `returning_rows` : UPDATE ... RETURNING이 돌려줄 행.
     """
 
     def __init__(
-        self, rows=None, *, rowcount=0, scalar_results=None, scalar_default=0
+        self,
+        rows=None,
+        *,
+        rowcount=0,
+        scalar_results=None,
+        scalar_default=0,
+        returning_rows=None,
     ):
         self.rows = rows or {}
         self.scalar_results = scalar_results or {}
         # 엔티티 대역이 걸리지 않는 집계 쿼리(MAX+1, COUNT 등)의 기본 반환값.
         self.scalar_default = scalar_default
+        # UPDATE ... RETURNING이 돌려줄 행. 폐기된 VC의 상태 목록 배정을
+        # 흉내내는 데 쓴다.
+        self.returning_rows = list(returning_rows or [])
         self.scalar_query_hits = {}
         self.added = []
         self.executed = []
@@ -128,6 +138,10 @@ class FakeDb:
             return FakeResult(scalar=self.chain_tip)
 
         self.executed.append(statement)
+        if "RETURNING" in text.upper():
+            return FakeResult(
+                rows=self.returning_rows, rowcount=len(self.returning_rows)
+            )
         return FakeResult(rowcount=self._rowcount)
 
     async def scalar(self, statement):
