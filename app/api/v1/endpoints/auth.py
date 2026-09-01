@@ -472,7 +472,11 @@ async def bind_holder_key(
     비트도 함께 켜진다. 동일 키를 다시 바인딩하는 경우에는 소유자가
     그대로이므로 폐기하지 않는다.
     """
-    device = await db.get(Device, body.device_id)
+    # VC 발급(POST /did/issue)과 같은 기기 행을 잠가 두 요청을 직렬화한다.
+    # 잠금이 없으면 발급이 옛 holder_did를 읽은 사이에 재바인딩이 폐기를
+    # 끝내고, 뒤늦게 저장된 옛 키용 VC가 폐기를 피해 ACTIVE로 남는다.
+    # 그 VC는 폐기 목록에도 없어 분실 기기가 키오스크를 그대로 통과한다.
+    device = await db.get(Device, body.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
 

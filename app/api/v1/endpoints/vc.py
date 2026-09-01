@@ -265,7 +265,12 @@ async def issue_credential(
             detail="adult verification was invalidated",
         )
 
-    device = await db.get(Device, verification.device_id)
+    # 재바인딩(POST /auth/devices/bind-holder-key)과 같은 기기 행을 잠가 두
+    # 요청을 직렬화한다. 잠금이 없으면 여기서 읽은 holder_did가 아래에서 VC를
+    # 저장하기 전에 재바인딩으로 바뀔 수 있고, 그렇게 저장된 옛 키용 VC는
+    # 이미 끝난 폐기를 피해 ACTIVE로 남는다. 폐기 목록에도 없으므로 분실
+    # 기기가 키오스크를 그대로 통과한다.
+    device = await db.get(Device, verification.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
     if device.status != "ACTIVE":
