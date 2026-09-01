@@ -355,6 +355,7 @@ async def issue_credential(
             "content": {"application/jwt": {"schema": {"type": "string"}}},
         },
         404: {"description": "해당 상태 목록이 없음"},
+        503: {"description": "상태 목록이 비어 있어 신뢰할 수 있는 응답을 만들 수 없음"},
     },
 )
 async def get_status_list(
@@ -381,13 +382,20 @@ async def get_status_list(
             detail="status list not found",
         )
 
-    # 목록이 만들어진 직후라 비어 있을 수 있다. 폐기가 하나도 없는 상태와
-    # 같으므로 전부 0인 비트열로 응답한다.
-    encoded_list = status_list.encoded_list or empty_encoded_list()
+    if not status_list.encoded_list:
+        # 전부 0인 목록으로 대신 응답하면 안 된다. 그 서명은 "폐기된 VC가
+        # 하나도 없다"는 발급자의 보증이라, 저장된 값이 손상된 경우에도
+        # 폐기된 VC를 키오스크에서 되살리게 된다.
+        # 목록은 생성 시점에 채워지므로 여기가 비어 있으면 정상이 아니다.
+        # 잘못된 보증을 하느니 조회를 실패시킨다.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="status list is not available",
+        )
 
     token = issue_status_list_vc(
         status_list_url=status_list.status_list_url,
-        encoded_list=encoded_list,
+        encoded_list=status_list.encoded_list,
         # DB는 'REVOCATION'이지만 규격상 VC 본문은 소문자다.
         status_purpose=(
             PURPOSE_REVOCATION

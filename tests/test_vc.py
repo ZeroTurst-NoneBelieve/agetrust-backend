@@ -530,8 +530,13 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
         for untouched in (0, 2, 4, 94566, 94568, BITSTRING_SIZE - 1):
             self.assertFalse(get_bit(received, untouched))
 
-    async def test_empty_encoded_list_falls_back_to_all_zero(self):
-        """목록이 아직 비어 있어도 해석 가능한 비트열을 돌려준다."""
+    async def test_empty_encoded_list_is_not_signed_as_empty(self):
+        """비어 있는 목록을 "폐기 없음"으로 서명해 주면 안 된다.
+
+        전부 0인 목록에 발급자 서명을 붙이는 것은 "폐기된 VC가 하나도 없다"는
+        보증이다. 저장된 값이 손상됐을 때 그 보증을 해주면 폐기된 VC가
+        키오스크에서 되살아난다. 조회를 실패시키는 편이 안전하다.
+        """
         status_list = SimpleNamespace(
             id=7,
             status_list_url=self.URL,
@@ -541,12 +546,11 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _FakeDb({(CredentialStatusList, 7): status_list})
 
-        response = await get_status_list(7, db)
-        subject = self._decode(response)["vc"]["credentialSubject"]
-        received = decode_bitstring(subject["encodedList"])
+        with self.assertRaises(HTTPException) as raised:
+            await get_status_list(7, db)
 
-        self.assertEqual(len(received) * 8, BITSTRING_SIZE)
-        self.assertFalse(any(received))
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail, "status list is not available")
 
     async def test_missing_status_list_returns_404(self):
         db = _FakeDb()

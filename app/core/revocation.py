@@ -14,12 +14,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.status_list import (
-    decode_bitstring,
-    encode_bitstring,
-    new_bitstring,
-    set_bit,
-)
+from app.core.status_list import decode_bitstring, encode_bitstring, set_bit
 from app.models import CredentialStatusList, VcCredential
 
 
@@ -67,6 +62,10 @@ async def mark_revoked_bits(db: AsyncSession, entries) -> int:
 
     한 목록을 여러 번 열지 않도록 먼저 목록별로 묶고, 목록 id 순서대로
     잠근다. 잠그는 순서가 요청마다 다르면 서로를 기다리다 교착에 빠진다.
+
+    목록이 없거나 encoded_list가 비어 있으면 예외를 던진다. 폐기를 절반만
+    반영하고 성공으로 돌려주면 분실 기기가 계속 통과하므로, 전부 되돌리고
+    실패를 알리는 편이 안전하다.
     """
     by_list: dict[int, list[int]] = {}
     for status_list_id, status_list_index in entries:
@@ -84,13 +83,22 @@ async def mark_revoked_bits(db: AsyncSession, entries) -> int:
             .with_for_update()
         )
         if status_list is None:
-            continue
+            # VC가 가리키는 목록이 사라졌다. 조용히 넘어가면 DB에는 REVOKED로
+            # 남지만 키오스크는 계속 통과시키는, 폐기한 줄 알았는데 안 된
+            # 상태가 된다. 트랜잭션을 통째로 되돌려 재바인딩 자체를 실패시킨다.
+            raise RuntimeError(
+                f"status list {status_list_id} referenced by a credential is missing"
+            )
 
-        bitstring = (
-            decode_bitstring(status_list.encoded_list)
-            if status_list.encoded_list
-            else new_bitstring()
-        )
+        if not status_list.encoded_list:
+            # 빈 목록으로 새로 시작하면 이전에 폐기된 VC들이 모두 되살아난다.
+            # 목록은 생성 시점에 채워지므로, 비어 있다는 것은 저장된 값이
+            # 손상됐다는 뜻이다.
+            raise RuntimeError(
+                f"status list {status_list_id} has no encoded_list"
+            )
+
+        bitstring = decode_bitstring(status_list.encoded_list)
 
         changed = 0
         for index in indexes:

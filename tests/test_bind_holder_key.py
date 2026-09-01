@@ -162,6 +162,57 @@ class BindHolderKeyRevocationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audit.payload["revoked_status_list_bits"], 0)
         self.assertEqual(db.commits, 1)
 
+    async def test_missing_status_list_aborts_instead_of_skipping(self):
+        """VC가 가리키는 목록이 없으면 폐기를 성공으로 끝내면 안 된다.
+
+        조용히 넘어가면 DB에는 REVOKED로 남지만 키오스크는 계속 통과시킨다.
+        폐기한 줄 알았는데 안 된 상태가 가장 위험하므로 전체를 되돌린다.
+        """
+        pem, signature, _ = _make_key_material(2)
+        device = SimpleNamespace(
+            id=2, user_id=1, status="ACTIVE",
+            holder_did="did:key:zOldKeyFromLostPhone", holder_public_key=None,
+        )
+        db = _FakeDb(
+            {(Device, 2): device},
+            # 배정은 있는데 그 목록을 찾을 수 없는 상황.
+            returning_rows=[(7, 3)],
+        )
+        body = BindHolderKeyRequest(
+            device_id=2, holder_public_key_pem=pem, proof_signature_b64=signature
+        )
+
+        with self.assertRaises(RuntimeError):
+            await bind_holder_key(body, self.user, db)
+
+        self.assertEqual(db.commits, 0, "실패했는데 커밋됐다")
+
+    async def test_corrupted_status_list_aborts(self):
+        """encoded_list가 비어 있으면 빈 목록으로 새로 시작하면 안 된다.
+
+        목록은 생성 시점에 채워지므로 비어 있다는 것은 손상됐다는 뜻이다.
+        새 비트열로 덮어쓰면 이전에 폐기된 VC들이 모두 되살아난다.
+        """
+        pem, signature, _ = _make_key_material(2)
+        device = SimpleNamespace(
+            id=2, user_id=1, status="ACTIVE",
+            holder_did="did:key:zOldKeyFromLostPhone", holder_public_key=None,
+        )
+        status_list = SimpleNamespace(id=7, encoded_list=None, version=1)
+        db = _FakeDb(
+            {(Device, 2): device},
+            scalar_results={CredentialStatusList: status_list},
+            returning_rows=[(7, 3)],
+        )
+        body = BindHolderKeyRequest(
+            device_id=2, holder_public_key_pem=pem, proof_signature_b64=signature
+        )
+
+        with self.assertRaises(RuntimeError):
+            await bind_holder_key(body, self.user, db)
+
+        self.assertEqual(db.commits, 0, "실패했는데 커밋됐다")
+
 
 if __name__ == "__main__":
     unittest.main()
