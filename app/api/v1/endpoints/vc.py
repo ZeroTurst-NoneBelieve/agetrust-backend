@@ -1,6 +1,6 @@
 """최초 성인 인증 결과 기록, VC 발급 및 DID Document 조회."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,11 +10,17 @@ from app.core.audit import record_audit_event
 from app.core.status_list import (
     BITSTRING_SIZE,
     DB_PURPOSE_REVOCATION,
+    PURPOSE_REVOCATION,
     build_credential_status,
     build_status_list_url,
     empty_encoded_list,
 )
-from app.core.vc import ISSUER_DID, build_did_document, issue_vc
+from app.core.vc import (
+    ISSUER_DID,
+    build_did_document,
+    issue_status_list_vc,
+    issue_vc,
+)
 from app.database import get_db
 from app.models import (
     AdultVerification,
@@ -332,6 +338,72 @@ async def issue_credential(
 
 
 @router.get(
+    "/status/{status_list_id}",
+    summary="StatusList2021 폐기 목록 조회",
+    response_class=Response,
+    responses={
+        200: {
+            "description": (
+                "서명된 StatusList2021Credential (JWT). "
+                "Content-Type은 application/jwt다."
+            ),
+            "content": {"application/jwt": {"schema": {"type": "string"}}},
+        },
+        404: {"description": "해당 상태 목록이 없음"},
+    },
+)
+async def get_status_list(
+    status_list_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """VC 폐기 목록을 서명된 StatusList2021Credential로 반환한다.
+
+    키오스크가 호출하므로 로그인 인증이 필요 없는 공개 엔드포인트다.
+    발급된 VC의 credentialStatus.statusListCredential이 이 주소를 가리킨다.
+
+    키오스크는 "이 VC 유효한가?"를 한 건씩 묻지 않고 목록 전체를 받아간다.
+    개별 조회 방식이면 서버가 누가 언제 어디서 인증을 시도했는지 모두 알게
+    되기 때문이다. 목록에는 13만 개의 비트가 함께 들어 있어 어느 VC를
+    확인하는지 서버가 알 수 없다.
+
+    응답은 발급자 키로 서명된 JWT다. 서명이 없으면 중간에서 전부 0인 목록으로
+    바꿔치기해 폐기된 VC를 되살릴 수 있다.
+    """
+    status_list = await db.get(CredentialStatusList, status_list_id)
+    if status_list is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail="status list not found",
+        )
+
+    # 목록이 만들어진 직후라 비어 있을 수 있다. 폐기가 하나도 없는 상태와
+    # 같으므로 전부 0인 비트열로 응답한다.
+    encoded_list = status_list.encoded_list or empty_encoded_list()
+
+    token = issue_status_list_vc(
+        status_list_url=status_list.status_list_url,
+        encoded_list=encoded_list,
+        # DB는 'REVOCATION'이지만 규격상 VC 본문은 소문자다.
+        status_purpose=(
+            PURPOSE_REVOCATION
+            if status_list.status_purpose == DB_PURPOSE_REVOCATION
+            else status_list.status_purpose.lower()
+        ),
+    )
+
+    return Response(
+        content=token,
+        media_type="application/jwt",
+        headers={
+            # 폐기 반영이 늦어지는 만큼이 위험 구간이므로 짧게 잡는다.
+            "Cache-Control": "public, max-age=300",
+            # 목록이 그대로면 키오스크가 본문을 다시 받지 않아도 된다.
+            "ETag": f'W/"{status_list_id}-{status_list.version}"',
+        },
+    )
+
+
+@router.get(
     "/did/issuer",
     summary="발급자 DID Document 조회",
 )
@@ -368,4 +440,3 @@ async def resolve_did_document(did: str):
             status.HTTP_400_BAD_REQUEST,
             detail=str(error),
         ) from error
-    

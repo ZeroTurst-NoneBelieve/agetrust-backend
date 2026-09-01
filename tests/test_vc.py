@@ -24,11 +24,20 @@ from app.core.vc import (  # noqa: E402
     issue_vc,
 )
 from app.api.v1.endpoints.vc import (  # noqa: E402
+    get_status_list,
     issue_credential,
     record_adult_verification,
 )
 from app.main import app  # noqa: E402
-from app.core.status_list import BITSTRING_SIZE  # noqa: E402
+from app.core.status_list import (  # noqa: E402
+    BITSTRING_SIZE,
+    decode_bitstring,
+    empty_encoded_list,
+    encode_bitstring,
+    get_bit,
+    new_bitstring,
+    set_bit,
+)
 from app.models import (  # noqa: E402
     AdultVerification,
     CredentialStatusList,
@@ -152,7 +161,14 @@ class VcRouteTests(unittest.TestCase):
         self.assertIn("/api/v1/did/issue", paths)
         self.assertIn("/api/v1/did/issuer", paths)
         self.assertIn("/api/v1/did/{did}", paths)
+        self.assertIn("/api/v1/status/{status_list_id}", paths)
         self.assertNotIn("/api/v1/did/verify", paths)
+
+    def test_status_list_endpoint_requires_no_auth(self):
+        """키오스크가 호출하므로 로그인 없이 열려 있어야 한다."""
+        operation = app.openapi()["paths"]["/api/v1/status/{status_list_id}"]["get"]
+
+        self.assertNotIn("security", operation)
 
     def test_issuer_did_document_endpoint(self):
         response = self._get("/api/v1/did/issuer")
@@ -426,6 +442,121 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.commits, 0)
 
 
+class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """#27 — 키오스크가 받아가는 공개 폐기 목록."""
+
+    URL = "http://localhost:8000/api/v1/status/7"
+
+    @staticmethod
+    def _public_key():
+        return Ed25519PrivateKey.from_private_bytes(_ISSUER_KEY_BYTES).public_key()
+
+    def _decode(self, response):
+        """키오스크가 하는 일: 발급자 공개키로 서명을 검증하고 내용을 읽는다."""
+        return jwt.decode(
+            response.body.decode(),
+            self._public_key(),
+            algorithms=["EdDSA"],
+        )
+
+    async def test_returns_signed_status_list_credential(self):
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url=self.URL,
+            status_purpose="REVOCATION",
+            encoded_list=empty_encoded_list(),
+            version=1,
+        )
+        db = _FakeDb({(CredentialStatusList, 7): status_list})
+
+        response = await get_status_list(7, db)
+
+        self.assertEqual(response.media_type, "application/jwt")
+        payload = self._decode(response)
+
+        self.assertEqual(payload["iss"], ISSUER_DID)
+        credential = payload["vc"]
+        self.assertIn("StatusList2021Credential", credential["type"])
+        self.assertEqual(credential["id"], self.URL)
+
+        subject = credential["credentialSubject"]
+        self.assertEqual(subject["type"], "StatusList2021")
+        # DB는 'REVOCATION'이지만 규격상 VC 본문은 소문자다.
+        self.assertEqual(subject["statusPurpose"], "revocation")
+
+        # 목록은 최신 상태 그 자체이므로 만료를 두지 않는다.
+        self.assertNotIn("exp", payload)
+
+    async def test_tampered_list_fails_signature_check(self):
+        """서명이 없으면 전부 0인 가짜 목록으로 바꿔치기할 수 있다."""
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url=self.URL,
+            status_purpose="REVOCATION",
+            encoded_list=empty_encoded_list(),
+            version=1,
+        )
+        db = _FakeDb({(CredentialStatusList, 7): status_list})
+
+        response = await get_status_list(7, db)
+        attacker_key = Ed25519PrivateKey.generate().public_key()
+
+        with self.assertRaises(jwt.InvalidSignatureError):
+            jwt.decode(
+                response.body.decode(), attacker_key, algorithms=["EdDSA"]
+            )
+
+    async def test_revoked_bits_are_visible_to_kiosk(self):
+        """폐기된 VC의 비트가 키오스크가 받는 목록에 그대로 나타나야 한다."""
+        bitstring = new_bitstring()
+        set_bit(bitstring, 3)
+        set_bit(bitstring, 94567)
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url=self.URL,
+            status_purpose="REVOCATION",
+            encoded_list=encode_bitstring(bitstring),
+            version=3,
+        )
+        db = _FakeDb({(CredentialStatusList, 7): status_list})
+
+        response = await get_status_list(7, db)
+        subject = self._decode(response)["vc"]["credentialSubject"]
+        received = decode_bitstring(subject["encodedList"])
+
+        self.assertTrue(get_bit(received, 3))
+        self.assertTrue(get_bit(received, 94567))
+        # 폐기되지 않은 VC는 계속 통과해야 한다.
+        for untouched in (0, 2, 4, 94566, 94568, BITSTRING_SIZE - 1):
+            self.assertFalse(get_bit(received, untouched))
+
+    async def test_empty_encoded_list_falls_back_to_all_zero(self):
+        """목록이 아직 비어 있어도 해석 가능한 비트열을 돌려준다."""
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url=self.URL,
+            status_purpose="REVOCATION",
+            encoded_list=None,
+            version=1,
+        )
+        db = _FakeDb({(CredentialStatusList, 7): status_list})
+
+        response = await get_status_list(7, db)
+        subject = self._decode(response)["vc"]["credentialSubject"]
+        received = decode_bitstring(subject["encodedList"])
+
+        self.assertEqual(len(received) * 8, BITSTRING_SIZE)
+        self.assertFalse(any(received))
+
+    async def test_missing_status_list_returns_404(self):
+        db = _FakeDb()
+
+        with self.assertRaises(HTTPException) as raised:
+            await get_status_list(999, db)
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.detail, "status list not found")
+
+
 if __name__ == "__main__":
     unittest.main()
-    

@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.config import settings
 from app.core.did_key import public_key_to_did_key
+from app.core.status_list import STATUS_LIST_CREDENTIAL_TYPE
 
 _MULTICODEC_ED25519_PUB = b"\xed\x01"
 
@@ -18,6 +19,9 @@ _MULTICODEC_ED25519_PUB = b"\xed\x01"
 VC_CONTEXT = "https://www.w3.org/2018/credentials/v1"
 VC_TYPE = "VerifiableCredential"
 ADULT_CREDENTIAL_TYPE = "AdultCredential"
+
+# W3C Status List 2021
+STATUS_LIST_CONTEXT = "https://w3id.org/vc/status-list/2021/v1"
 
 # W3C DID Core / did:key
 DID_CONTEXT = "https://www.w3.org/ns/did/v1"
@@ -125,3 +129,41 @@ def issue_vc(
 
     token = jwt.encode(payload, _issuer_private_key, algorithm="EdDSA")
     return token, credential_id, expires_at
+
+
+def issue_status_list_vc(
+    status_list_url: str,
+    encoded_list: str,
+    status_purpose: str,
+) -> str:
+    """폐기 목록 자체를 담은 StatusList2021Credential JWT를 만든다.
+
+    목록을 서명 없이 내보내면 중간에서 전부 0인 가짜 목록으로 바꿔치기할 수
+    있고, 그러면 폐기된 VC가 키오스크를 다시 통과한다. 발급자 키로 서명해야
+    키오스크가 목록의 진위를 확인할 수 있다.
+
+    성인 VC와 달리 만료(exp)를 넣지 않는다. 목록은 폐기가 생길 때마다 갱신되는
+    최신 상태 그 자체이고, 만료를 두면 갱신이 늦어졌을 때 키오스크가 검증할
+    목록을 잃는다.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    payload = {
+        "iss": ISSUER_DID,
+        "sub": status_list_url,
+        "jti": status_list_url,
+        "iat": now,
+        "nbf": now,
+        "vc": {
+            "@context": [VC_CONTEXT, STATUS_LIST_CONTEXT],
+            "id": status_list_url,
+            "type": [VC_TYPE, STATUS_LIST_CREDENTIAL_TYPE],
+            "issuer": ISSUER_DID,
+            "credentialSubject": {
+                "id": f"{status_list_url}#list",
+                "type": "StatusList2021",
+                "statusPurpose": status_purpose,
+                "encodedList": encoded_list,
+            },
+        },
+    }
+    return jwt.encode(payload, _issuer_private_key, algorithm="EdDSA")
