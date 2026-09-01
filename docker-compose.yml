@@ -36,6 +36,11 @@ services:
       # 기본값 false를 유지한다(#24). 여기 없으면 .env에 DEV_MODE=true를 적어도
       # 조용히 무시되어, 문서대로 했는데 안 켜지는 상태가 된다.
       DEV_MODE: ${DEV_MODE:-false}
+      # 발급되는 VC의 credentialStatus에 박히는 공개 주소(#27). 키오스크가 이
+      # 주소로 폐기 목록을 받아가므로, 키오스크에서 실제로 접근 가능한 값이어야
+      # 한다. localhost로 발급하면 키오스크가 자기 자신을 찾는다.
+      # 한 번 발급된 VC 안의 주소는 나중에 고칠 수 없다.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
     ports:
       - "8000:8000"
     depends_on:
