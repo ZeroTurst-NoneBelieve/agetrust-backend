@@ -1,13 +1,28 @@
 """최초 성인 인증 결과 기록, VC 발급 및 DID Document 조회."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.config import settings
 from app.core.audit import record_audit_event
+from app.core.status_list import (
+    BITSTRING_SIZE,
+    DB_PURPOSE_REVOCATION,
+    build_credential_status,
+    build_status_list_url,
+    empty_encoded_list,
+)
 from app.core.vc import ISSUER_DID, build_did_document, issue_vc
 from app.database import get_db
-from app.models import AdultVerification, Device, User, VcCredential
+from app.models import (
+    AdultVerification,
+    CredentialStatusList,
+    Device,
+    User,
+    VcCredential,
+)
 from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
 from app.schemas.errors import AdultVerificationStatus
 from app.schemas.vc import (
@@ -18,6 +33,88 @@ from app.schemas.vc import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["did-vc"])
+
+# 상태 목록 생성 구간을 감싸는 advisory lock 키.
+# 목록이 아직 하나도 없을 때는 잠글 행 자체가 없어서 with_for_update를 걸 수
+# 없다. PostgreSQL의 트랜잭션 단위 advisory lock은 행이 없어도 "이름"에
+# 자물쇠를 걸 수 있어, 첫 발급이 동시에 들어와도 목록이 두 개 생기지 않는다.
+# 값 자체에 의미는 없고 다른 용도와 겹치지 않기만 하면 된다.
+_STATUS_LIST_LOCK_KEY = 27_0001
+
+
+async def _allocate_status_list_entry(
+    db: AsyncSession,
+) -> tuple[CredentialStatusList, int]:
+    """발급할 VC에 배정할 (상태 목록, 인덱스)를 하나 확보한다.
+
+    같은 인덱스가 두 VC에 배정되면, 한쪽을 폐기했을 때 관계없는 다른 VC까지
+    키오스크에서 거부된다. 따라서 인덱스 배정은 반드시 한 번에 하나씩
+    이루어져야 한다.
+
+    흔한 실수는 MAX(status_list_index) + 1을 잠금 없이 읽는 것이다. 동시에
+    들어온 두 요청이 같은 MAX를 보고 같은 번호를 가져간다. 여기서는 advisory
+    lock으로 이 구간을 직렬화하고, 모델의
+    UNIQUE(status_list_id, status_list_index)가 마지막 안전망이 된다.
+
+    이 함수는 커밋하지 않는다. 호출부의 트랜잭션에 그대로 얹혀서, VC 저장이
+    실패하면 배정도 같이 롤백된다.
+    """
+    await db.execute(select(func.pg_advisory_xact_lock(_STATUS_LIST_LOCK_KEY)))
+
+    status_list = await db.scalar(
+        select(CredentialStatusList)
+        .where(
+            CredentialStatusList.issuer_did == ISSUER_DID,
+            CredentialStatusList.status_purpose == DB_PURPOSE_REVOCATION,
+        )
+        .order_by(CredentialStatusList.id)
+        .limit(1)
+    )
+
+    if status_list is None:
+        status_list = await _create_status_list(db)
+
+    next_index = await db.scalar(
+        select(func.coalesce(func.max(VcCredential.status_list_index), -1) + 1).where(
+            VcCredential.status_list_id == status_list.id
+        )
+    )
+
+    if next_index >= BITSTRING_SIZE:
+        # 목록 하나가 13만 건을 담으므로 현실적으로 도달하지 않는다. 다만
+        # 조용히 넘어가면 범위를 벗어난 인덱스가 배정되므로 명시적으로 막는다.
+        # 목록을 여러 개로 넘기는 처리는 별도 이슈로 다룬다.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="status list is full",
+        )
+
+    return status_list, next_index
+
+
+async def _create_status_list(db: AsyncSession) -> CredentialStatusList:
+    """첫 발급 시점에 폐기용 상태 목록을 하나 만든다.
+
+    status_list_url에 목록의 id가 들어가는데 id는 INSERT 후에야 정해지므로,
+    임시값으로 넣고 flush해 id를 받은 뒤 실제 URL로 채운다.
+
+    encoded_list는 비워두지 않고 전부 0인 비트열로 채운다. NULL로 두면
+    키오스크가 목록을 조회했을 때 해석할 값이 없어진다.
+    """
+    status_list = CredentialStatusList(
+        issuer_did=ISSUER_DID,
+        status_purpose=DB_PURPOSE_REVOCATION,
+        status_list_url=f"pending:{DB_PURPOSE_REVOCATION}",
+        encoded_list=empty_encoded_list(),
+    )
+    db.add(status_list)
+    await db.flush()  # id 확보
+
+    status_list.status_list_url = build_status_list_url(
+        settings.public_base_url, status_list.id
+    )
+    await db.flush()
+    return status_list
 
 
 @router.post(
@@ -176,7 +273,18 @@ async def issue_credential(
             detail="device has no holder_did. Register device and bind holder key first.",
         )
 
-    vc_jwt, credential_id, expires_at = issue_vc(device.holder_did)
+    # 상태 목록의 자리를 먼저 잡아야 VC 본문에 credentialStatus를 실을 수 있다.
+    # did:key VC는 자기완결적이라 키오스크가 서버에 묻지 않고 검증하는데,
+    # 이 한 줄이 없으면 폐기된 VC도 만료 전까지 그대로 통과한다.
+    status_list, status_list_index = await _allocate_status_list_entry(db)
+    credential_status = build_credential_status(
+        status_list.status_list_url, status_list_index
+    )
+
+    vc_jwt, credential_id, expires_at = issue_vc(
+        device.holder_did,
+        credential_status=credential_status,
+    )
 
     vc_row = VcCredential(
         user_id=user.id,
@@ -187,6 +295,8 @@ async def issue_credential(
         issuer_did=ISSUER_DID,
         credential_format="JWT_VC",
         status="ACTIVE",
+        status_list_id=status_list.id,
+        status_list_index=status_list_index,
         expires_at=expires_at,
     )
     db.add(vc_row)
@@ -258,3 +368,4 @@ async def resolve_did_document(did: str):
             status.HTTP_400_BAD_REQUEST,
             detail=str(error),
         ) from error
+    

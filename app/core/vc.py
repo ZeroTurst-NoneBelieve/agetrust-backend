@@ -81,8 +81,18 @@ def build_did_document(did: str) -> dict:
 def issue_vc(
     holder_did: str,
     expires_days: int | None = None,
+    credential_status: dict | None = None,
 ) -> tuple[str, str, datetime | None]:
-    """최소 성인 여부 클레임만 담은 W3C VC JWT를 발급한다."""
+    """최소 성인 여부 클레임만 담은 W3C VC JWT를 발급한다.
+
+    credential_status를 주면 VC 본문에 credentialStatus로 실어 보낸다.
+    키오스크는 이 값을 보고 폐기 목록을 조회한다. 상태 목록의 인덱스를
+    배정하려면 DB가 필요한데 이 함수는 DB를 알지 못하므로, 호출부가
+    배정 결과를 만들어 넘겨주는 구조로 둔다.
+
+    VC JWT에서 credentialStatus는 payload 최상단이 아니라 payload["vc"]
+    안에 들어간다. credentialSubject와 같은 자리다.
+    """
     credential_id = f"urn:uuid:{uuid.uuid4()}"
     now = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -101,6 +111,12 @@ def issue_vc(
             },
         },
     }
+
+    # 상태 목록을 쓰지 않고 발급하던 기존 경로를 그대로 두기 위해,
+    # 값이 있을 때만 넣는다. 빈 dict를 실어 보내면 키오스크가 조회할
+    # 주소가 없는 credentialStatus가 되므로 None과 같이 취급한다.
+    if credential_status:
+        payload["vc"]["credentialStatus"] = credential_status
 
     days = expires_days if expires_days is not None else settings.vc_expire_days
     expires_at = now + timedelta(days=days) if days else None

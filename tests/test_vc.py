@@ -28,7 +28,13 @@ from app.api.v1.endpoints.vc import (  # noqa: E402
     record_adult_verification,
 )
 from app.main import app  # noqa: E402
-from app.models import AdultVerification, Device, VcCredential  # noqa: E402
+from app.core.status_list import BITSTRING_SIZE  # noqa: E402
+from app.models import (  # noqa: E402
+    AdultVerification,
+    CredentialStatusList,
+    Device,
+    VcCredential,
+)
 from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
 from tests.fakes import FakeDb as _FakeDb  # noqa: E402
 
@@ -59,6 +65,36 @@ class VcCoreTests(unittest.TestCase):
             datetime.fromtimestamp(payload["exp"], timezone.utc),
             expires_at,
         )
+
+    def test_issue_vc_embeds_credential_status_inside_vc(self):
+        credential_status = {
+            "id": "http://localhost:8000/api/v1/status/1#7",
+            "type": "StatusList2021Entry",
+            "statusPurpose": "revocation",
+            "statusListIndex": "7",
+            "statusListCredential": "http://localhost:8000/api/v1/status/1",
+        }
+        token, _, _ = issue_vc(ISSUER_DID, credential_status=credential_status)
+        payload = jwt.decode(
+            token,
+            options={"verify_signature": False},
+            algorithms=["EdDSA"],
+        )
+
+        # JWT VC에서 credentialStatus는 payload 최상단이 아니라 vc 안에 있어야
+        # 키오스크가 규격대로 찾을 수 있다.
+        self.assertEqual(payload["vc"]["credentialStatus"], credential_status)
+        self.assertNotIn("credentialStatus", payload)
+
+    def test_issue_vc_omits_credential_status_when_not_given(self):
+        token, _, _ = issue_vc(ISSUER_DID)
+        payload = jwt.decode(
+            token,
+            options={"verify_signature": False},
+            algorithms=["EdDSA"],
+        )
+
+        self.assertNotIn("credentialStatus", payload["vc"])
 
     def test_issue_vc_can_omit_expiration(self):
         token, _, expires_at = issue_vc(ISSUER_DID, expires_days=0)
@@ -269,6 +305,127 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             response.expires_at,
         )
 
+    @staticmethod
+    def _issuable_rows():
+        verification = SimpleNamespace(
+            id=3,
+            user_id=1,
+            device_id=2,
+            result_status="SUCCESS",
+            invalidated_at=None,
+        )
+        device = SimpleNamespace(
+            id=2,
+            user_id=1,
+            status="ACTIVE",
+            holder_did=ISSUER_DID,
+        )
+        return {
+            (AdultVerification, 3): verification,
+            (Device, 2): device,
+        }
+
+    @staticmethod
+    def _credential_status_of(response):
+        payload = jwt.decode(
+            response.credential,
+            options={"verify_signature": False},
+            algorithms=["EdDSA"],
+        )
+        return payload["vc"]["credentialStatus"]
+
+    async def test_issue_credential_creates_first_status_list(self):
+        """상태 목록이 하나도 없는 첫 발급은 목록을 만들고 0번을 배정한다."""
+        db = _FakeDb(self._issuable_rows())
+
+        response = await issue_credential(
+            IssueVcRequest(adult_verification_id=3),
+            self.user,
+            db,
+        )
+
+        status_lists = [r for r in db.added if isinstance(r, CredentialStatusList)]
+        self.assertEqual(len(status_lists), 1)
+        status_list = status_lists[0]
+        self.assertEqual(status_list.status_purpose, "REVOCATION")
+        self.assertEqual(status_list.issuer_did, ISSUER_DID)
+        # 비어 있으면 키오스크가 해석할 값이 없다. 전부 0인 비트열이어야 한다.
+        self.assertTrue(status_list.encoded_list)
+        # id가 정해진 뒤 실제 URL로 채워져야 한다.
+        self.assertNotIn("pending", status_list.status_list_url)
+        self.assertTrue(
+            status_list.status_list_url.endswith(f"/api/v1/status/{status_list.id}")
+        )
+
+        vc_row = next(r for r in db.added if isinstance(r, VcCredential))
+        self.assertEqual(vc_row.status_list_id, status_list.id)
+        self.assertEqual(vc_row.status_list_index, 0)
+
+    async def test_issue_credential_embeds_matching_credential_status(self):
+        """VC 본문의 credentialStatus가 DB에 저장된 배정과 일치해야 한다."""
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url="http://localhost:8000/api/v1/status/7",
+        )
+        db = _FakeDb(
+            self._issuable_rows(),
+            scalar_results={CredentialStatusList: status_list},
+            scalar_default=42,  # MAX(index) + 1
+        )
+
+        response = await issue_credential(
+            IssueVcRequest(adult_verification_id=3),
+            self.user,
+            db,
+        )
+
+        vc_row = next(r for r in db.added if isinstance(r, VcCredential))
+        self.assertEqual(vc_row.status_list_id, 7)
+        self.assertEqual(vc_row.status_list_index, 42)
+        # 이미 목록이 있으므로 새로 만들지 않는다.
+        self.assertEqual(
+            [r for r in db.added if isinstance(r, CredentialStatusList)], []
+        )
+
+        credential_status = self._credential_status_of(response)
+        self.assertEqual(
+            credential_status,
+            {
+                "id": "http://localhost:8000/api/v1/status/7#42",
+                "type": "StatusList2021Entry",
+                # DB는 'REVOCATION'이지만 VC 본문은 규격대로 소문자다.
+                "statusPurpose": "revocation",
+                # 규격상 정수가 아니라 문자열이다.
+                "statusListIndex": "42",
+                "statusListCredential": "http://localhost:8000/api/v1/status/7",
+            },
+        )
+        self.assertIsInstance(credential_status["statusListIndex"], str)
+
+    async def test_issue_credential_rejects_full_status_list(self):
+        """범위를 벗어난 인덱스를 조용히 배정하지 않는다."""
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url="http://localhost:8000/api/v1/status/7",
+        )
+        db = _FakeDb(
+            self._issuable_rows(),
+            scalar_results={CredentialStatusList: status_list},
+            scalar_default=BITSTRING_SIZE,
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            await issue_credential(
+                IssueVcRequest(adult_verification_id=3),
+                self.user,
+                db,
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail, "status list is full")
+        self.assertEqual(db.commits, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+    

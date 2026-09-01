@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     otp_expire_minutes: int = 5
     otp_max_attempts: int = 5
     vc_expire_days: int = 365
+    # VC 본문의 credentialStatus에 박히는 공개 URL의 기준 주소.
+    # 키오스크가 상태 목록을 조회할 주소이고, 한번 발급된 VC 안에는
+    # 그때의 값이 그대로 남아 수정할 수 없다.
+    # 시크릿이 아니라 배포 환경마다 달라지는 주소이므로 기본값을 둔다.
+    public_base_url: str = "http://localhost:8000"
     challenge_expire_seconds: int = 120
 
     # 개발 편의 기능(OTP 응답 노출, 콘솔 출력) 스위치.
