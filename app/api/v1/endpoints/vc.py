@@ -1,5 +1,7 @@
 """최초 성인 인증 결과 기록, VC 발급 및 DID Document 조회."""
 
+import random
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,9 +59,9 @@ async def _allocate_status_list_entry(
     키오스크에서 거부된다. 따라서 인덱스 배정은 반드시 한 번에 하나씩
     이루어져야 한다.
 
-    흔한 실수는 MAX(status_list_index) + 1을 잠금 없이 읽는 것이다. 동시에
-    들어온 두 요청이 같은 MAX를 보고 같은 번호를 가져간다. 여기서는 advisory
-    lock으로 이 구간을 직렬화하고, 모델의
+    인덱스는 무작위로 고른다. MAX + 1로 순차 배정하면 인덱스만 봐도 발급
+    순서와 그때까지의 총 발급량이 드러나기 때문이다. W3C도 랜덤 배정을
+    권고한다. 동시성은 advisory lock으로 이 구간을 직렬화해 막고, 모델의
     UNIQUE(status_list_id, status_list_index)가 마지막 안전망이 된다.
 
     이 함수는 커밋하지 않는다. 호출부의 트랜잭션에 그대로 얹혀서, VC 저장이
@@ -80,13 +82,11 @@ async def _allocate_status_list_entry(
     if status_list is None:
         status_list = await _create_status_list(db)
 
-    next_index = await db.scalar(
-        select(func.coalesce(func.max(VcCredential.status_list_index), -1) + 1).where(
-            VcCredential.status_list_id == status_list.id
-        )
+    # 랜덤 배정에서는 최댓값으로 남은 자리를 알 수 없으므로 개수로 판단한다.
+    used_count = await db.scalar(
+        select(func.count()).where(VcCredential.status_list_id == status_list.id)
     )
-
-    if next_index >= BITSTRING_SIZE:
+    if used_count >= BITSTRING_SIZE:
         # 목록 하나가 13만 건을 담으므로 현실적으로 도달하지 않는다. 다만
         # 조용히 넘어가면 범위를 벗어난 인덱스가 배정되므로 명시적으로 막는다.
         # 목록을 여러 개로 넘기는 처리는 별도 이슈로 다룬다.
@@ -94,6 +94,10 @@ async def _allocate_status_list_entry(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="status list is full",
         )
+
+    # 남은 자리가 압도적으로 많으므로 그냥 하나 고른다. 충돌은 advisory lock과
+    # UNIQUE(status_list_id, status_list_index)가 막는다.
+    next_index = random.randrange(BITSTRING_SIZE)
 
     return status_list, next_index
 

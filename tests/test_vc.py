@@ -351,7 +351,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         return payload["vc"]["credentialStatus"]
 
     async def test_issue_credential_creates_first_status_list(self):
-        """상태 목록이 하나도 없는 첫 발급은 목록을 만들고 0번을 배정한다."""
+        """상태 목록이 하나도 없는 첫 발급은 목록을 만들고 인덱스를 배정한다."""
         db = _FakeDb(self._issuable_rows())
 
         await issue_credential(
@@ -375,7 +375,9 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         vc_row = next(r for r in db.added if isinstance(r, VcCredential))
         self.assertEqual(vc_row.status_list_id, status_list.id)
-        self.assertEqual(vc_row.status_list_index, 0)
+        # 인덱스는 무작위로 배정되므로 특정 값이 아니라 범위를 확인한다.
+        self.assertIsNotNone(vc_row.status_list_index)
+        self.assertTrue(0 <= vc_row.status_list_index < BITSTRING_SIZE)
 
     async def test_issue_credential_embeds_matching_credential_status(self):
         """VC 본문의 credentialStatus가 DB에 저장된 배정과 일치해야 한다."""
@@ -386,7 +388,6 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         db = _FakeDb(
             self._issuable_rows(),
             scalar_results={CredentialStatusList: status_list},
-            scalar_default=42,  # MAX(index) + 1
         )
 
         response = await issue_credential(
@@ -397,7 +398,10 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         vc_row = next(r for r in db.added if isinstance(r, VcCredential))
         self.assertEqual(vc_row.status_list_id, 7)
-        self.assertEqual(vc_row.status_list_index, 42)
+        # 인덱스는 무작위다. 값 자체가 아니라 DB와 VC 본문이 같은 값을
+        # 쓰는지가 이 테스트의 목적이다.
+        assigned_index = vc_row.status_list_index
+        self.assertTrue(0 <= assigned_index < BITSTRING_SIZE)
         # 이미 목록이 있으므로 새로 만들지 않는다.
         self.assertEqual(
             [r for r in db.added if isinstance(r, CredentialStatusList)], []
@@ -407,12 +411,12 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             credential_status,
             {
-                "id": "http://localhost:8000/api/v1/status/7#42",
+                "id": f"http://localhost:8000/api/v1/status/7#{assigned_index}",
                 "type": "StatusList2021Entry",
                 # DB는 'REVOCATION'이지만 VC 본문은 규격대로 소문자다.
                 "statusPurpose": "revocation",
                 # 규격상 정수가 아니라 문자열이다.
-                "statusListIndex": "42",
+                "statusListIndex": str(assigned_index),
                 "statusListCredential": "http://localhost:8000/api/v1/status/7",
             },
         )
