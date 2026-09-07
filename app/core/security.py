@@ -3,6 +3,9 @@
 DID 키 인코딩은 app/core/did_key.py 에 분리했다.
 """
 
+import hashlib
+import hmac
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -89,9 +92,6 @@ def decode_login_token(token: str, expected_type: str = "access") -> dict:
 # ---------------------------------------------------------------------------
 # OTP (SMS 인증번호)
 # ---------------------------------------------------------------------------
-import hashlib
-import hmac
-import secrets
 
 
 def generate_otp() -> str:
