@@ -15,6 +15,16 @@
   결과가 두 번 전송되는 것을 DB 차원에서 막는다. 전역 UNIQUE로 걸면 서로 다른
   키오스크가 우연히 같은 nonce를 만들었을 때 뒤에 온 정상 인증이 영구 거부되어
   감사 로그에서 사라진다
+- verification_logs.transport_type 추가 (삭제되는 테이블에서 갈 곳이 없어진
+  컬럼. 값은 2채널 조합이라 'QR_BLE', ADR-0003)
+- verification_logs.received_at / is_late 추가 (ADR-0011. 키오스크 시계를 믿지
+  않기 위해 서버 수신 시각을 함께 남기고, 7일 초과 지연을 버리지 않고 표시)
+- verification_logs.status_list_age_seconds 추가 (ADR-0013. 판정에 쓴
+  StatusList 캐시 나이. 캐시를 쓰지 않은 판정에는 값이 없어 NULL 허용)
+
+결과 기록 API(ADR-0011)가 아직 없어 이 시점에는 테이블이 비어 있다. API가
+생긴 뒤에 컬럼을 더하면 기존 행을 어떻게 채울지 정해야 하므로, 같은 리비전에
+함께 넣는다.
 
 두 테이블 모두 이 시점까지 어떤 코드 경로에서도 INSERT된 적이 없다
 (키오스크 검증 결과 기록 API가 아직 없음). 따라서 NOT NULL 컬럼을 기본값
@@ -62,6 +72,34 @@ def upgrade() -> None:
         ['kiosk_id', 'nonce_hash'],
     )
 
+    # ADR-0011 결과 기록 API 계약 / ADR-0013 StatusList 캐시 추적
+    op.add_column(
+        'verification_logs',
+        sa.Column('transport_type', sa.String(length=20), nullable=False),
+    )
+    op.create_check_constraint(
+        'ck_verification_logs_transport_type',
+        'verification_logs',
+        "transport_type IN ('QR_BLE')",
+    )
+    op.add_column(
+        'verification_logs',
+        sa.Column(
+            'received_at',
+            sa.TIMESTAMP(timezone=True),
+            server_default=sa.text('now()'),
+            nullable=False,
+        ),
+    )
+    op.add_column(
+        'verification_logs',
+        sa.Column('is_late', sa.Boolean(), server_default='false', nullable=False),
+    )
+    op.add_column(
+        'verification_logs',
+        sa.Column('status_list_age_seconds', sa.Integer(), nullable=True),
+    )
+
     op.drop_table('verification_challenges')
 
 
@@ -88,6 +126,12 @@ def downgrade() -> None:
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('challenge_hash'),
     )
+
+    op.drop_column('verification_logs', 'status_list_age_seconds')
+    op.drop_column('verification_logs', 'is_late')
+    op.drop_column('verification_logs', 'received_at')
+    # CHECK 제약도 컬럼과 함께 사라진다
+    op.drop_column('verification_logs', 'transport_type')
 
     # 복합 UNIQUE는 컬럼과 함께 사라진다
     op.drop_column('verification_logs', 'nonce_hash')
