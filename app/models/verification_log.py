@@ -92,6 +92,22 @@ class VerificationLog(Base):
 
     `result_status`의 `FAIL_CHALLENGE`는 개정 후에도 유지한다. 서버가 챌린지를
     처리하지 않을 뿐, 키오스크가 자기 챌린지 검증 실패를 판정해 보고하는 값이다.
+
+    ## 정상 판정이 `SUCCESS`가 아니라 `PASS`인 이유
+
+    설계서 §13과 초기 마이그레이션은 이 컬럼의 정상값을 `SUCCESS`로 잡았으나,
+    ADR-0011이 결과 기록 API의 요청 본문을 `"result_status": "PASS"`로 확정했다.
+    승인된 API 계약을 기준으로 모델과 CHECK를 `PASS`로 맞춘다.
+
+    계약이 `PASS`인 것은 이 값의 출처가 서버가 아니라 키오스크이기 때문이다.
+    키오스크는 판정을 BLE `status_notify` `0x20 PASS`로 폰에 먼저 보내고
+    (transport-protocol §5.7) 같은 판정을 이 API로 보고한다. 경계마다 이름을
+    바꾸면 폰 화면과 서버 기록의 용어가 갈라진다 — `failure_code`를 `0x21`의
+    코드와 같은 값으로 맞춘 것과 같은 이유다(ADR-0011).
+
+    `adult_verifications.result_status`는 `SUCCESS`로 남는다. 그쪽은 서버가
+    신분증-셀카 대조를 직접 판정해 남기는 다른 테이블이고, 값을 정한 계약도
+    다르다. 두 테이블의 정상값이 다른 것은 실수가 아니다.
     """
 
     __tablename__ = "verification_logs"
@@ -99,7 +115,7 @@ class VerificationLog(Base):
         UniqueConstraint("kiosk_id", "nonce_hash", name="uq_verification_logs_kiosk_nonce"),
         CheckConstraint(
             "result_status IN ("
-            "'SUCCESS', 'FAIL_EXPIRED', 'FAIL_FACE_MISMATCH', 'FAIL_INVALID_VC', "
+            "'PASS', 'FAIL_EXPIRED', 'FAIL_FACE_MISMATCH', 'FAIL_INVALID_VC', "
             "'FAIL_INVALID_VP', 'FAIL_REVOKED_VC', 'FAIL_CHALLENGE', 'INTERNAL_ERROR'"
             ")",
             name="ck_verification_logs_result_status",

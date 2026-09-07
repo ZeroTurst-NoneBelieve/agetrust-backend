@@ -21,6 +21,12 @@
   않기 위해 서버 수신 시각을 함께 남기고, 7일 초과 지연을 버리지 않고 표시)
 - verification_logs.status_list_age_seconds 추가 (ADR-0013. 판정에 쓴
   StatusList 캐시 나이. 캐시를 쓰지 않은 판정에는 값이 없어 NULL 허용)
+- verification_logs.result_status의 정상값을 'SUCCESS' -> 'PASS'로 변경.
+  ADR-0011이 결과 기록 API 본문을 "result_status": "PASS"로 확정했다. 값의
+  출처가 키오스크이고 키오스크는 같은 판정을 BLE status_notify 0x20 PASS로
+  폰에 먼저 보내므로(transport-protocol §5.7), 경계마다 이름이 갈리지 않도록
+  DB도 계약에 맞춘다. adult_verifications.result_status의 'SUCCESS'는 서버가
+  직접 판정하는 다른 테이블이라 그대로 둔다
 
 결과 기록 API(ADR-0011)가 아직 없어 이 시점에는 테이블이 비어 있다. API가
 생긴 뒤에 컬럼을 더하면 기존 행을 어떻게 채울지 정해야 하므로, 같은 리비전에
@@ -100,6 +106,21 @@ def upgrade() -> None:
         sa.Column('status_list_age_seconds', sa.Integer(), nullable=True),
     )
 
+    # 정상값 'SUCCESS' -> 'PASS' (ADR-0011 결과 기록 API 계약).
+    # CHECK는 69dc2d9f707c가 만든 것이라 여기서 지우고 다시 만든다.
+    # 이 테이블은 아직 비어 있어 기존 행을 옮길 UPDATE가 필요 없다.
+    op.drop_constraint(
+        'ck_verification_logs_result_status', 'verification_logs', type_='check'
+    )
+    op.create_check_constraint(
+        'ck_verification_logs_result_status',
+        'verification_logs',
+        "result_status IN ("
+        "'PASS', 'FAIL_EXPIRED', 'FAIL_FACE_MISMATCH', 'FAIL_INVALID_VC', "
+        "'FAIL_INVALID_VP', 'FAIL_REVOKED_VC', 'FAIL_CHALLENGE', 'INTERNAL_ERROR'"
+        ")",
+    )
+
     op.drop_table('verification_challenges')
 
 
@@ -125,6 +146,18 @@ def downgrade() -> None:
         sa.ForeignKeyConstraint(['kiosk_id'], ['kiosks.id'], ),
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('challenge_hash'),
+    )
+
+    op.drop_constraint(
+        'ck_verification_logs_result_status', 'verification_logs', type_='check'
+    )
+    op.create_check_constraint(
+        'ck_verification_logs_result_status',
+        'verification_logs',
+        "result_status IN ("
+        "'SUCCESS', 'FAIL_EXPIRED', 'FAIL_FACE_MISMATCH', 'FAIL_INVALID_VC', "
+        "'FAIL_INVALID_VP', 'FAIL_REVOKED_VC', 'FAIL_CHALLENGE', 'INTERNAL_ERROR'"
+        ")",
     )
 
     op.drop_column('verification_logs', 'status_list_age_seconds')

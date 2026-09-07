@@ -51,7 +51,18 @@ class AdultVerificationFailureCode(StrEnum):
 
 
 class VerificationResultStatus(StrEnum):
-    SUCCESS = "SUCCESS"
+    """verification_logs.result_status. 키오스크 결과 기록 API(ADR-0011)의 계약값.
+
+    정상 판정이 위 AdultVerificationStatus와 달리 SUCCESS가 아니라 PASS다.
+    둘은 다른 테이블이고 값을 정한 주체가 다르다. adult_verifications는 서버가
+    신분증-셀카 대조를 판정해 남기는 기록이라 설계서의 SUCCESS를 그대로 쓴다.
+    verification_logs는 키오스크가 자기 판정을 보고하는 기록이고, 그 판정은
+    BLE status_notify 0x20 PASS로 폰에 먼저 나간다(transport-protocol §5.7).
+    같은 판정을 API 경계에서만 SUCCESS로 바꿔 부르면 키오스크 화면과 서버
+    기록의 용어가 갈라지므로, ADR-0011의 요청 본문 예시대로 PASS로 맞춘다.
+    """
+
+    PASS = "PASS"
     FAIL_EXPIRED = "FAIL_EXPIRED"
     FAIL_FACE_MISMATCH = "FAIL_FACE_MISMATCH"
     FAIL_INVALID_VC = "FAIL_INVALID_VC"
