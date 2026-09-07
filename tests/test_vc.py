@@ -354,7 +354,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         """상태 목록이 하나도 없는 첫 발급은 목록을 만들고 0번을 배정한다."""
         db = _FakeDb(self._issuable_rows())
 
-        response = await issue_credential(
+        await issue_credential(
             IssueVcRequest(adult_verification_id=3),
             self.user,
             db,
