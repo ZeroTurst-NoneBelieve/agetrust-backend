@@ -119,7 +119,12 @@ def issue_vc(
     # 상태 목록을 쓰지 않고 발급하던 기존 경로를 그대로 두기 위해,
     # 값이 있을 때만 넣는다. 빈 dict를 실어 보내면 키오스크가 조회할
     # 주소가 없는 credentialStatus가 되므로 None과 같이 취급한다.
+    #
+    # credentialStatus를 실을 때는 그 용어를 정의하는 context도 함께
+    # 넣어야 한다. 둘 중 하나만 있으면 엄격한 JSON-LD 검증기가
+    # StatusList2021Entry를 해석하지 못해 외부 키오스크에서 거절될 수 있다.
     if credential_status:
+        payload["vc"]["@context"].append(STATUS_LIST_CONTEXT)
         payload["vc"]["credentialStatus"] = credential_status
 
     days = expires_days if expires_days is not None else settings.vc_expire_days
