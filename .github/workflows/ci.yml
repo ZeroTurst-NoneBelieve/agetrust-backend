@@ -1,0 +1,84 @@
+name: CI
+
+# 컨벤션 4-3: dev/main 대상 PR은 Lint와 테스트를 통과해야 머지할 수 있다.
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+# 같은 브랜치에 새 커밋이 오면 진행 중이던 이전 실행은 취소한다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Dockerfile의 python:3.11-slim과 맞춘다.
+          python-version: "3.11"
+          cache: pip
+
+      # 버전을 고정한다. ruff는 버전마다 규칙이 추가되므로 고정하지 않으면
+      # 코드를 건드리지 않았는데 어느 날 CI가 빨개진다.
+      - name: Install ruff
+        run: pip install ruff==0.15.21
+
+      # 규칙은 pyproject.toml의 [tool.ruff]를 따른다.
+      - name: ruff check
+        run: ruff check .
+
+  test:
+    name: Test (unittest + E2E)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: agetrust
+          POSTGRES_PASSWORD: agetrust
+          POSTGRES_DB: agetrust_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agetrust -d agetrust_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://agetrust:agetrust@localhost:5432/agetrust_test
+      # E2E는 전용 변수가 있을 때만 켜진다. 없으면 3건이 조용히 스킵된다.
+      E2E_DATABASE_URL: postgresql+asyncpg://agetrust:agetrust@localhost:5432/agetrust_test
+      # 테스트 전용 더미 값이다. 실제 키를 Secrets에 넣을 필요가 없다.
+      # ISSUER_PRIVATE_KEY는 base64(0..31 바이트)로, 테스트가 쓰는 값과 같다.
+      SECRET_KEY: test-secret-key-at-least-32-bytes
+      ISSUER_PRIVATE_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      # 브로커를 띄우지 않으므로 Outbox Publisher는 끈다.
+      KAFKA_PUBLISHER_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 스키마를 마이그레이션으로 만든다. 마이그레이션이 깨져 있으면
+      # 테스트보다 먼저 여기서 걸린다.
+      - name: alembic upgrade head
+        run: alembic upgrade head
+
+      - name: unittest
+        run: python -m unittest discover -s tests -p "test_*.py" -v
