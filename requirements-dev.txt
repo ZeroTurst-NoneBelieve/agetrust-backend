@@ -1,0 +1,10 @@
+# 개발 전용 의존성. 운영 이미지는 이 파일을 설치하지 않는다.
+# (Dockerfile은 requirements.txt만 COPY·install 한다.)
+#
+# 설치: pip install -r requirements.txt -r requirements-dev.txt
+
+# 린터. .github/workflows/ci.yml의 `pip install ruff==...`와 같은 버전으로
+# 고정한다. ruff는 버전마다 규칙이 추가되므로, 버전이 어긋나면 코드를
+# 건드리지 않았는데 로컬에서만(또는 CI에서만) 위반이 뜬다.
+# 올릴 때는 워크플로의 버전도 같이 올릴 것.
+ruff==0.15.21
