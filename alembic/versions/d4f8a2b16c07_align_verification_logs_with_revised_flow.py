@@ -10,8 +10,11 @@
 - verification_logs.challenge_id 제거
 - verification_logs.kiosk_id 추가 (경유 테이블이 사라져 직접 필요.
   admin-web #3 매장별 감사 로그가 kiosks -> stores -> businesses로 JOIN)
-- verification_logs.nonce 추가 (UNIQUE. mobile #17 K-7의 로컬 큐잉 재시도로
-  같은 결과가 두 번 전송되는 것을 DB 차원에서 막는다)
+- verification_logs.nonce_hash 추가 (설계서 §12의 "원문 대신 hash 저장" 원칙)
+- (kiosk_id, nonce_hash) 복합 UNIQUE. mobile #17 K-7의 로컬 큐잉 재시도로 같은
+  결과가 두 번 전송되는 것을 DB 차원에서 막는다. 전역 UNIQUE로 걸면 서로 다른
+  키오스크가 우연히 같은 nonce를 만들었을 때 뒤에 온 정상 인증이 영구 거부되어
+  감사 로그에서 사라진다
 
 두 테이블 모두 이 시점까지 어떤 코드 경로에서도 INSERT된 적이 없다
 (키오스크 검증 결과 기록 API가 아직 없음). 따라서 NOT NULL 컬럼을 기본값
@@ -49,9 +52,15 @@ def upgrade() -> None:
 
     op.add_column(
         'verification_logs',
-        sa.Column('nonce', sa.String(length=128), nullable=False),
+        sa.Column('nonce_hash', sa.String(length=128), nullable=False),
     )
-    op.create_unique_constraint(None, 'verification_logs', ['nonce'])
+    # kiosk_id가 선두인 btree 인덱스가 이 제약에 딸려 온다.
+    # admin-web #3의 kiosks -> stores -> businesses 조회 경로가 이를 탄다.
+    op.create_unique_constraint(
+        'uq_verification_logs_kiosk_nonce',
+        'verification_logs',
+        ['kiosk_id', 'nonce_hash'],
+    )
 
     op.drop_table('verification_challenges')
 
@@ -80,7 +89,8 @@ def downgrade() -> None:
         sa.UniqueConstraint('challenge_hash'),
     )
 
-    op.drop_column('verification_logs', 'nonce')
+    # 복합 UNIQUE는 컬럼과 함께 사라진다
+    op.drop_column('verification_logs', 'nonce_hash')
     op.drop_column('verification_logs', 'kiosk_id')
 
     op.add_column(
