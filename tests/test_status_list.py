@@ -12,6 +12,7 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
 from app.api.v1.endpoints.vc import _index_is_taken, _pick_unused_index  # noqa: E402
+from app.schemas.errors import VcError  # noqa: E402
 from app.core.status_list import (  # noqa: E402
     BITSTRING_BYTES,
     build_status_list_url,
@@ -109,7 +110,7 @@ class StatusListAllocationTests(unittest.IsolatedAsyncioTestCase):
                 await _pick_unused_index(db, 7)
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.detail, "status list is full")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_FULL.value})
         pick.assert_not_called()
 
 

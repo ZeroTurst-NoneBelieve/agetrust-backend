@@ -6,7 +6,7 @@ import re
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, Response, status
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -86,7 +86,7 @@ async def _pick_unused_index(db: AsyncSession, status_list_id: int) -> int:
     taken = set(result.scalars().all())
     available = [index for index in range(BITSTRING_SIZE) if index not in taken]
     if not available:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="status list is full")
+        raise api_error(VcError.STATUS_LIST_FULL, status.HTTP_503_SERVICE_UNAVAILABLE)
     return secrets.choice(available)
 
 
@@ -130,10 +130,7 @@ async def _allocate_status_list_entry(
         # 목록 하나가 13만 건을 담으므로 현실적으로 도달하지 않는다. 다만
         # 조용히 넘어가면 범위를 벗어난 인덱스가 배정되므로 명시적으로 막는다.
         # 목록을 여러 개로 넘기는 처리는 별도 이슈로 다룬다.
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="status list is full",
-        )
+        raise api_error(VcError.STATUS_LIST_FULL, status.HTTP_503_SERVICE_UNAVAILABLE)
 
     # 잠금은 동시 배정만 막는다. 이미 쓰인 후보는 직접 확인하고 다시 뽑는다.
     for _ in range(_INDEX_PICK_ATTEMPTS):
@@ -286,6 +283,13 @@ async def record_adult_verification(
                 "기기(DEVICE_NOT_FOUND)를 찾을 수 없거나 본인 소유가 아님"
             ),
         },
+        503: {
+            "model": VcErrorResponse,
+            "description": (
+                "폐기 목록 13만 자리가 모두 차 인덱스를 배정할 수 없음 "
+                "(STATUS_LIST_FULL)"
+            ),
+        },
     },
 )
 async def issue_credential(
@@ -435,8 +439,17 @@ def _etag_matches(if_none_match: list[str] | None, etag: str) -> bool:
             "description": "키오스크 키가 없거나 잘못됨 또는 키오스크가 비활성/폐기 상태임",
             "model": AuthErrorResponse,
         },
-        404: {"description": "해당 상태 목록이 없음"},
-        503: {"description": "상태 목록이 비어 있거나 손상되어 응답할 수 없음"},
+        404: {
+            "model": VcErrorResponse,
+            "description": "해당 상태 목록이 없음 (STATUS_LIST_NOT_FOUND)",
+        },
+        503: {
+            "model": VcErrorResponse,
+            "description": (
+                "상태 목록이 비어 있거나 손상되어 응답할 수 없음 "
+                "(STATUS_LIST_UNAVAILABLE)"
+            ),
+        },
     },
 )
 async def get_status_list(
@@ -464,9 +477,9 @@ async def get_status_list(
     """
     status_list = await db.get(CredentialStatusList, status_list_id)
     if status_list is None:
-        raise HTTPException(
+        raise api_error(
+            VcError.STATUS_LIST_NOT_FOUND,
             status.HTTP_404_NOT_FOUND,
-            detail="status list not found",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -479,9 +492,9 @@ async def get_status_list(
             raise ValueError("empty status list")
         decode_bitstring(status_list.encoded_list)
     except ValueError as error:
-        raise HTTPException(
+        raise api_error(
+            VcError.STATUS_LIST_UNAVAILABLE,
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="status list is not available",
             headers={"Cache-Control": "no-store"},
         ) from error
 

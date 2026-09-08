@@ -13,13 +13,22 @@ from enum import StrEnum
 from fastapi import HTTPException
 
 
-def api_error(code: StrEnum, status_code: int, message: str | None = None) -> HTTPException:
+def api_error(
+    code: StrEnum,
+    status_code: int,
+    message: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> HTTPException:
     """오류 코드를 담은 HTTPException을 만든다.
 
     message는 코드로 표현할 수 없는 진단 정보에만 채운다(예: DID 파싱 실패 사유).
     분기 근거는 어디까지나 code이며, message는 사람이 읽는 용도다.
+
+    headers는 오류 응답에도 캐시 지시가 필요한 경우에 쓴다. 폐기 목록 조회의
+    404·503이 그렇다 — no-store를 빠뜨리면 중간 캐시가 "목록 없음"을 들고
+    있다가 폐기가 반영된 뒤에도 그대로 돌려줄 수 있다.
     """
     detail: dict[str, str] = {"code": code.value}
     if message is not None:
         detail["message"] = message
-    return HTTPException(status_code=status_code, detail=detail)
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)

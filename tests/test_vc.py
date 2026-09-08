@@ -50,6 +50,7 @@ from app.models import (  # noqa: E402
     Kiosk,
     VcCredential,
 )
+from app.schemas.errors import VcError  # noqa: E402
 from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
 from tests.fakes import FakeDb as _FakeDb  # noqa: E402
 
@@ -456,7 +457,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.detail, "status list is full")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_FULL.value})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_retries_an_already_assigned_index(self):
@@ -663,7 +664,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             await get_status_list(7, db)
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.detail, "status list is not available")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_UNAVAILABLE.value})
 
     async def test_invalid_nonempty_lists_are_rejected_before_signing(self):
         short_gzip = base64.urlsafe_b64encode(gzip.compress(b"\x00")).decode().rstrip("=")
@@ -794,7 +795,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             await get_status_list(999, db)
 
         self.assertEqual(raised.exception.status_code, 404)
-        self.assertEqual(raised.exception.detail, "status list not found")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_NOT_FOUND.value})
 
 
 if __name__ == "__main__":
