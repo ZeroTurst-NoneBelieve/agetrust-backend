@@ -12,6 +12,7 @@ VC 한 건이 비트 하나를 차지하며, 0이면 유효하고 1이면 폐기
 
 import base64
 import gzip
+import re
 
 # 규격이 요구하는 최소 크기. 16KB = 131,072비트이므로 목록 하나로
 # VC 13만 건을 담을 수 있다.
@@ -44,10 +45,16 @@ def encode_bitstring(bitstring: bytes | bytearray) -> str:
 
 def decode_bitstring(encoded: str) -> bytearray:
     """encode_bitstring의 역연산. 저장된 문자열을 비트열로 되돌린다."""
+    # 기본 base64 디코더는 공백·잘못된 문자를 조용히 버린다. 그 결과를
+    # 정상으로 판단해 원래의 손상된 문자열에 서명하지 않도록, encoder와
+    # 동일한 패딩 없는 base64url 문자만 허용한다.
+    if not isinstance(encoded, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+        raise ValueError("encoded_list is not an unpadded base64url string")
     # 인코딩할 때 뗀 패딩을 다시 붙여야 디코딩이 된다.
     padded = encoded + "=" * (-len(encoded) % 4)
     try:
-        raw = gzip.decompress(base64.urlsafe_b64decode(padded))
+        compressed = base64.b64decode(padded, altchars=b"-_", validate=True)
+        raw = gzip.decompress(compressed)
     except Exception as error:  # noqa: BLE001 - 손상된 저장값을 한 곳에서 걸러낸다
         raise ValueError("encoded_list is not a valid StatusList2021 bitstring") from error
     if len(raw) < BITSTRING_BYTES:
@@ -97,7 +104,7 @@ def build_status_list_url(base_url: str, status_list_id: int) -> str:
     만들 때 한 번 계산해 status_list_url 컬럼에 저장하고, 이후에는 설정값으로
     다시 계산하지 말고 저장된 값을 읽어 써야 한다.
     """
-    return f"{base_url.rstrip('/')}/api/v1/status/{status_list_id}"
+    return f"{base_url.rstrip('/')}/api/v1/status-lists/{status_list_id}"
 
 
 def build_credential_status(status_list_url: str, index: int) -> dict:

@@ -1,9 +1,12 @@
 import asyncio
 import base64
+import gzip
+import hashlib
 import os
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import jwt
@@ -24,11 +27,13 @@ from app.core.vc import (  # noqa: E402
     issue_vc,
 )
 from app.api.v1.endpoints.vc import (  # noqa: E402
+    _INDEX_PICK_ATTEMPTS,
     get_status_list,
     issue_credential,
     record_adult_verification,
 )
 from app.main import app  # noqa: E402
+from app.database import get_db  # noqa: E402
 from app.core.status_list import (  # noqa: E402
     BITSTRING_SIZE,
     decode_bitstring,
@@ -42,6 +47,7 @@ from app.models import (  # noqa: E402
     AdultVerification,
     CredentialStatusList,
     Device,
+    Kiosk,
     VcCredential,
 )
 from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
@@ -161,14 +167,22 @@ class VcRouteTests(unittest.TestCase):
         self.assertIn("/api/v1/did/issue", paths)
         self.assertIn("/api/v1/did/issuer", paths)
         self.assertIn("/api/v1/did/{did}", paths)
-        self.assertIn("/api/v1/status/{status_list_id}", paths)
+        self.assertIn("/api/v1/status-lists/{status_list_id}", paths)
+        self.assertNotIn("/api/v1/status/{status_list_id}", paths)
         self.assertNotIn("/api/v1/did/verify", paths)
 
-    def test_status_list_endpoint_requires_no_auth(self):
-        """키오스크가 호출하므로 로그인 없이 열려 있어야 한다."""
-        operation = app.openapi()["paths"]["/api/v1/status/{status_list_id}"]["get"]
+    def test_status_list_route_documents_kiosk_api_key_authentication(self):
+        operation = app.openapi()["paths"]["/api/v1/status-lists/{status_list_id}"]["get"]
 
-        self.assertNotIn("security", operation)
+        self.assertEqual(operation["security"], [{"KioskApiKey": []}])
+        scheme = app.openapi()["components"]["securitySchemes"]["KioskApiKey"]
+        self.assertEqual(scheme["type"], "apiKey")
+        self.assertEqual(scheme["in"], "header")
+        self.assertEqual(scheme["name"], "X-Kiosk-Key")
+        self.assertEqual(
+            operation["responses"]["401"]["content"]["application/json"]["schema"],
+            {"$ref": "#/components/schemas/AuthErrorResponse"},
+        )
 
     def test_issuer_did_document_endpoint(self):
         response = self._get("/api/v1/did/issuer")
@@ -370,7 +384,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         # id가 정해진 뒤 실제 URL로 채워져야 한다.
         self.assertNotIn("pending", status_list.status_list_url)
         self.assertTrue(
-            status_list.status_list_url.endswith(f"/api/v1/status/{status_list.id}")
+            status_list.status_list_url.endswith(f"/api/v1/status-lists/{status_list.id}")
         )
 
         vc_row = next(r for r in db.added if isinstance(r, VcCredential))
@@ -445,11 +459,106 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.detail, "status list is full")
         self.assertEqual(db.commits, 0)
 
+    async def test_issue_credential_retries_an_already_assigned_index(self):
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url="http://localhost:8000/api/v1/status-lists/7",
+        )
+        db = _FakeDb(
+            self._issuable_rows(),
+            scalar_results={CredentialStatusList: status_list},
+        )
+
+        with (
+            patch("app.api.v1.endpoints.vc.secrets.randbelow", side_effect=[4, 9]) as pick,
+            patch(
+                "app.api.v1.endpoints.vc._index_is_taken",
+                new_callable=AsyncMock,
+                side_effect=[True, False],
+            ) as is_taken,
+        ):
+            response = await issue_credential(
+                IssueVcRequest(adult_verification_id=3), self.user, db
+            )
+
+        self.assertEqual(pick.call_count, 2)
+        self.assertEqual(is_taken.await_args_list[0].args, (db, 7, 4))
+        self.assertEqual(is_taken.await_args_list[1].args, (db, 7, 9))
+        self.assertEqual(self._credential_status_of(response)["statusListIndex"], "9")
+        vc_row = next(row for row in db.added if isinstance(row, VcCredential))
+        self.assertEqual(vc_row.status_list_index, 9)
+        self.assertEqual(db.commits, 1)
+
+    async def test_repeated_collisions_use_fallback_instead_of_claiming_list_is_full(self):
+        status_list = SimpleNamespace(
+            id=7,
+            status_list_url="http://localhost:8000/api/v1/status-lists/7",
+        )
+        db = _FakeDb(
+            self._issuable_rows(),
+            scalar_results={CredentialStatusList: status_list},
+        )
+
+        with (
+            patch("app.api.v1.endpoints.vc.secrets.randbelow", return_value=4) as pick,
+            patch("app.api.v1.endpoints.vc._index_is_taken", new=AsyncMock(return_value=True)),
+            patch(
+                "app.api.v1.endpoints.vc._pick_unused_index",
+                new_callable=AsyncMock,
+                return_value=9,
+            ) as fallback,
+        ):
+            response = await issue_credential(
+                IssueVcRequest(adult_verification_id=3), self.user, db
+            )
+
+        self.assertEqual(pick.call_count, _INDEX_PICK_ATTEMPTS)
+        fallback.assert_awaited_once_with(db, 7)
+        self.assertEqual(self._credential_status_of(response)["statusListIndex"], "9")
+        self.assertEqual(db.commits, 1)
+
 
 class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
-    """#27 — 키오스크가 받아가는 공개 폐기 목록."""
+    """#27 — 등록된 키오스크가 인증 후 받아가는 폐기 목록."""
 
     URL = "http://localhost:8000/api/v1/status/7"
+
+    def _status_list(self, **overrides):
+        values = {
+            "id": 7,
+            "status_list_url": self.URL,
+            "status_purpose": "REVOCATION",
+            "encoded_list": empty_encoded_list(),
+            "version": 1,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    async def _http_get(db, path="/api/v1/status-lists/7", headers=None):
+        raw_key = "test-status-list-reader-key"
+        db.scalar_results[Kiosk] = SimpleNamespace(
+            id=5,
+            kiosk_identifier="test-status-list-reader",
+            api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+            status="ACTIVE",
+        )
+        request_headers = httpx.Headers(headers)
+        request_headers["X-Kiosk-Key"] = f"test-status-list-reader:{raw_key}"
+
+        async def override_db():
+            yield db
+
+        previous_overrides = app.dependency_overrides.copy()
+        app.dependency_overrides[get_db] = override_db
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                return await client.get(path, headers=request_headers)
+        finally:
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(previous_overrides)
 
     @staticmethod
     def _public_key():
@@ -488,7 +597,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
         # DB는 'REVOCATION'이지만 규격상 VC 본문은 소문자다.
         self.assertEqual(subject["statusPurpose"], "revocation")
 
-        # 목록은 최신 상태 그 자체이므로 만료를 두지 않는다.
+        # 오프라인 정책상 exp는 없다. 이 자체가 목록의 최신성을 보장하지는 않는다.
         self.assertNotIn("exp", payload)
 
     async def test_tampered_list_fails_signature_check(self):
@@ -555,6 +664,128 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail, "status list is not available")
+
+    async def test_invalid_nonempty_lists_are_rejected_before_signing(self):
+        short_gzip = base64.urlsafe_b64encode(gzip.compress(b"\x00")).decode().rstrip("=")
+        for encoded in (
+            "", "not-a-gzip-bitstring", short_gzip,
+            empty_encoded_list() + "!!!!", empty_encoded_list() + "\n",
+        ):
+            with self.subTest(encoded=encoded):
+                row = self._status_list(encoded_list=encoded)
+                db = _FakeDb({(CredentialStatusList, 7): row})
+                with patch("app.api.v1.endpoints.vc.issue_status_list_vc") as signer:
+                    with self.assertRaises(HTTPException) as raised:
+                        await get_status_list(7, db)
+
+                self.assertEqual(raised.exception.status_code, 503)
+                self.assertEqual(raised.exception.headers["Cache-Control"], "no-store")
+                signer.assert_not_called()
+
+    async def test_canonical_and_legacy_routes_serve_existing_signed_url(self):
+        row = self._status_list()
+        db = _FakeDb({(CredentialStatusList, 7): row})
+
+        canonical = await self._http_get(db)
+        legacy = await self._http_get(db, "/api/v1/status/7")
+
+        for response in (canonical, legacy):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["content-type"], "application/jwt")
+            self.assertEqual(response.headers["cache-control"], "private, no-cache")
+            self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+            payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
+            self.assertEqual(payload["vc"]["id"], self.URL)
+        self.assertEqual(canonical.headers["etag"], legacy.headers["etag"])
+        self.assertEqual(row.status_list_url, self.URL)
+
+    async def test_matching_etags_return_bodyless_304_with_cache_headers(self):
+        row = self._status_list()
+        db = _FakeDb({(CredentialStatusList, 7): row})
+        initial = await self._http_get(db)
+        etag = initial.headers["etag"]
+        strong_etag = etag.removeprefix("W/")
+        variants = (
+            {"If-None-Match": etag},
+            {"If-None-Match": strong_etag},
+            {"If-None-Match": f'"unrelated", {etag}'},
+            {"If-None-Match": "*"},
+            [("If-None-Match", '"unrelated"'), ("If-None-Match", strong_etag)],
+        )
+        for headers in variants:
+            with self.subTest(headers=headers):
+                with patch("app.api.v1.endpoints.vc.issue_status_list_vc") as signer:
+                    response = await self._http_get(db, headers=headers)
+
+                self.assertEqual(response.status_code, 304)
+                self.assertEqual(response.content, b"")
+                self.assertEqual(response.headers["etag"], etag)
+                self.assertEqual(
+                    response.headers["cache-control"], initial.headers["cache-control"]
+                )
+                self.assertEqual(response.headers["cache-control"], "private, no-cache")
+                self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+                signer.assert_not_called()
+
+    async def test_nonmatching_etags_return_signed_body(self):
+        row = self._status_list()
+        db = _FakeDb({(CredentialStatusList, 7): row})
+        initial = await self._http_get(db)
+
+        for header in ('"other"', 'W/"other", "another"', "invalid-unquoted-etag"):
+            with self.subTest(header=header):
+                response = await self._http_get(db, headers={"If-None-Match": header})
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["etag"], initial.headers["etag"])
+                payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
+                self.assertEqual(payload["vc"]["id"], self.URL)
+
+    async def test_corrupt_list_is_not_hidden_by_matching_conditional_request(self):
+        row = self._status_list()
+        db = _FakeDb({(CredentialStatusList, 7): row})
+        initial = await self._http_get(db)
+        short_gzip = base64.urlsafe_b64encode(gzip.compress(b"\x00")).decode().rstrip("=")
+
+        for encoded in (
+            None, "", "not-a-gzip-bitstring", short_gzip,
+            empty_encoded_list() + "!!!!", empty_encoded_list() + "\n",
+        ):
+            for header in (initial.headers["etag"], "*"):
+                with self.subTest(encoded=encoded, header=header):
+                    row.encoded_list = encoded
+                    with patch("app.api.v1.endpoints.vc.issue_status_list_vc") as signer:
+                        response = await self._http_get(db, headers={"If-None-Match": header})
+
+                    self.assertEqual(response.status_code, 503)
+                    self.assertEqual(response.headers["cache-control"], "no-store")
+                    self.assertNotIn("etag", response.headers)
+                    signer.assert_not_called()
+
+    async def test_content_version_and_url_changes_invalidate_old_etag(self):
+        for change in ("bits", "version", "url"):
+            with self.subTest(change=change):
+                row = self._status_list()
+                db = _FakeDb({(CredentialStatusList, 7): row})
+                initial = await self._http_get(db)
+                if change == "bits":
+                    bitstring = new_bitstring()
+                    set_bit(bitstring, 94567)
+                    row.encoded_list = encode_bitstring(bitstring)
+                elif change == "version":
+                    row.version += 1
+                else:
+                    row.status_list_url = "http://localhost:8000/api/v1/status-lists/7"
+
+                response = await self._http_get(db, headers={"If-None-Match": initial.headers["etag"]})
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotEqual(response.headers["etag"], initial.headers["etag"])
+                payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
+                self.assertEqual(payload["vc"]["id"], row.status_list_url)
+                if change == "bits":
+                    received = decode_bitstring(payload["vc"]["credentialSubject"]["encodedList"])
+                    self.assertTrue(get_bit(received, 94567))
 
     async def test_missing_status_list_returns_404(self):
         db = _FakeDb()

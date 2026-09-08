@@ -16,10 +16,13 @@ DB가 필요하다. localhost DATABASE_URL이 없으면 전체 스킵된다.
 """
 
 import base64
+import hashlib
 import os
+import secrets
 import time
 import unittest
 import uuid
+from urllib.parse import urlsplit
 
 # E2E는 실제 DB가 필요하므로 전용 환경변수로 명시적으로 켠다.
 # DATABASE_URL을 쓰면, 같은 discover 실행에서 먼저 임포트된 단위 테스트가
@@ -142,6 +145,42 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    async def _registered_kiosk(self):
+        """E2E 전용 DB에 새 사업장·키오스크를 만들고 테스트용 키를 발급한다.
+
+        기존 행은 조회하거나 수정하지 않는다. 실제 등록 API를 대신하는
+        fixture이며, 키 원문은 반환 헤더에만 두고 DB에는 SHA-256을 저장한다.
+        """
+        from app.models import Business, Kiosk, Store
+
+        raw_key = secrets.token_urlsafe(32)
+        identifier = _unique("e2e-kiosk-")
+        async with self.session_factory() as db:
+            business = Business(
+                business_number=_unique("e2e-business-"),
+                business_name="E2E 전용 사업자",
+            )
+            db.add(business)
+            await db.flush()
+            store = Store(
+                business_id=business.id,
+                store_code=_unique("e2e-store-"),
+                store_name="E2E 전용 매장",
+                store_type_code="E2E",
+                address="E2E 전용 테스트 주소",
+            )
+            db.add(store)
+            await db.flush()
+            kiosk = Kiosk(
+                store_id=store.id,
+                kiosk_identifier=identifier,
+                api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+                status="ACTIVE",
+            )
+            db.add(kiosk)
+            await db.commit()
+            return kiosk.id, {"X-Kiosk-Key": f"{identifier}:{raw_key}"}
+
     async def _signed_up_user(self):
         """전화 인증 -> 가입 -> 로그인까지 마친 사용자를 만든다."""
         r = await self.client.post("/api/v1/auth/phone/request", json={"phone_number": _phone()})
@@ -202,6 +241,13 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
     # 시나리오 1: 정상 사용자의 인증 -> VC 발급 -> 승인 로그 확인
     # -----------------------------------------------------------------
     async def test_scenario_1_happy_path_issues_vc_and_logs_approval(self):
+        import base58
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        from app.core.status_list import BITSTRING_SIZE, decode_bitstring, get_bit
+        from app.models import Kiosk
+
         admin = await self._admin_headers()
 
         # 1) 전화 인증
@@ -295,7 +341,8 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         # 8) 발급자 DID Document가 VC의 issuer와 일치하는가
         r = await self._timed("did/issuer", "GET", "/api/v1/did/issuer")
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["id"], issued["issuer_did"])
+        issuer_document = r.json()
+        self.assertEqual(issuer_document["id"], issued["issuer_did"])
 
         # 9) 어드민 웹이 볼 승인 로그가 실제로 조회되는가
         r = await self._timed(
@@ -328,6 +375,126 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         r = await self.client.get("/api/v1/admin/logs/chain-verification", headers=admin)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()["is_intact"], f"체인 파손: {r.json()['first_break']}")
+
+        # 12) 키오스크처럼 공개키로 VC와 목록의 서명을 검증하고 배정 비트를 읽는다.
+        multibase = issuer_document["verificationMethod"][0]["publicKeyMultibase"]
+        self.assertTrue(multibase.startswith("z"))
+        multicodec_key = base58.b58decode(multibase[1:])
+        self.assertEqual(multicodec_key[:2], b"\xed\x01")
+        self.assertEqual(len(multicodec_key), 34)
+        issuer_key = Ed25519PublicKey.from_public_bytes(multicodec_key[2:])
+        credential = jwt.decode(
+            issued["credential"], issuer_key, algorithms=["EdDSA"], issuer=issued["issuer_did"]
+        )
+        credential_status = credential["vc"]["credentialStatus"]
+        status_url = credential_status["statusListCredential"]
+        status_path = urlsplit(status_url).path
+        index = int(credential_status["statusListIndex"])
+        self.assertGreaterEqual(index, 0)
+        self.assertLess(index, BITSTRING_SIZE)
+
+        kiosk_id, kiosk_headers = await self._registered_kiosk()
+        status_list_id = status_path.rsplit("/", 1)[-1]
+        legacy_status_path = f"/api/v1/status/{status_list_id}"
+
+        # 새 주소와 기존 VC의 주소 모두 키오스크 키 없이는 조회할 수 없다.
+        # 일반 사용자 로그인 토큰도 키오스크 인증을 대신하지 않는다.
+        invalid_headers = (
+            {},
+            {"X-Kiosk-Key": kiosk_headers["X-Kiosk-Key"] + "-wrong"},
+            auth,
+        )
+        for path in (status_path, legacy_status_path):
+            for headers in invalid_headers:
+                with self.subTest(path=path, headers_present=tuple(headers)):
+                    r = await self.client.get(path, headers=headers)
+                    self.assertEqual(r.status_code, 401, r.text)
+                    self.assertEqual(r.json()["detail"]["code"], "KIOSK_KEY_INVALID")
+                    self.assertEqual(r.headers["cache-control"], "no-store")
+
+        r = await self._timed(
+            "status-list/initial", "GET", status_path, headers=kiosk_headers
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["content-type"], "application/jwt")
+        self.assertEqual(r.headers["cache-control"], "private, no-cache")
+        self.assertIn("x-kiosk-key", r.headers["vary"].lower())
+        initial_etag = r.headers["etag"]
+        initial_list = jwt.decode(r.text, issuer_key, algorithms=["EdDSA"], issuer=issued["issuer_did"])
+        self.assertEqual(initial_list["vc"]["id"], status_url)
+        initial_bits = decode_bitstring(initial_list["vc"]["credentialSubject"]["encodedList"])
+        self.assertFalse(get_bit(initial_bits, index), "방금 발급한 VC의 폐기 비트가 이미 켜져 있다")
+
+        r = await self.client.get(
+            status_path, headers={**kiosk_headers, "If-None-Match": initial_etag}
+        )
+        self.assertEqual(r.status_code, 304, r.text)
+        self.assertEqual(r.content, b"")
+        self.assertEqual(r.headers["etag"], initial_etag)
+        self.assertEqual(r.headers["cache-control"], "private, no-cache")
+        self.assertIn("x-kiosk-key", r.headers["vary"].lower())
+
+        # 이미 받은 ETag가 있어도 현재 비활성/폐기된 키오스크는 304를 못 받는다.
+        # 이 테스트에서 새로 만든 키오스크 행만 변경한다.
+        try:
+            for kiosk_status in ("INACTIVE", "REVOKED"):
+                async with self.session_factory() as db:
+                    kiosk = await db.get(Kiosk, kiosk_id)
+                    kiosk.status = kiosk_status
+                    await db.commit()
+                for path in (status_path, legacy_status_path):
+                    with self.subTest(kiosk_status=kiosk_status, path=path):
+                        r = await self.client.get(
+                            path, headers={**kiosk_headers, "If-None-Match": initial_etag}
+                        )
+                        self.assertEqual(r.status_code, 401, r.text)
+                        self.assertEqual(r.json()["detail"]["code"], "KIOSK_INACTIVE")
+                        self.assertEqual(r.headers["cache-control"], "no-store")
+        finally:
+            async with self.session_factory() as db:
+                kiosk = await db.get(Kiosk, kiosk_id)
+                kiosk.status = "ACTIVE"
+                await db.commit()
+
+        # 13) 동일 기기에 새 키를 바인딩하면 기존 VC의 폐기 비트와 ETag가 바뀐다.
+        new_pem, new_signature = _holder_material(device_id)
+        r = await self._timed(
+            "rebind-holder-key", "POST", "/api/v1/auth/devices/bind-holder-key", headers=auth,
+            json={
+                "device_id": device_id,
+                "holder_public_key_pem": new_pem,
+                "proof_signature_b64": new_signature,
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotEqual(r.json()["holder_did"], holder_did)
+
+        r = await self._timed(
+            "status-list/revoked", "GET", status_path,
+            headers={**kiosk_headers, "If-None-Match": initial_etag},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        revoked_etag = r.headers["etag"]
+        self.assertNotEqual(revoked_etag, initial_etag)
+        revoked_list = jwt.decode(r.text, issuer_key, algorithms=["EdDSA"], issuer=issued["issuer_did"])
+        revoked_subject = revoked_list["vc"]["credentialSubject"]
+        self.assertEqual(revoked_list["vc"]["id"], status_url)
+        self.assertTrue(get_bit(decode_bitstring(revoked_subject["encodedList"]), index))
+
+        r = await self.client.get(
+            status_path, headers={**kiosk_headers, "If-None-Match": revoked_etag}
+        )
+        self.assertEqual(r.status_code, 304, r.text)
+        self.assertEqual(r.content, b"")
+        self.assertEqual(r.headers["etag"], revoked_etag)
+
+        # 기존 발급 VC에 남은 /status/{id} 주소도 같은 서명된 폐기 목록을 준다.
+        r = await self.client.get(legacy_status_path, headers=kiosk_headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["etag"], revoked_etag)
+        legacy_list = jwt.decode(r.text, issuer_key, algorithms=["EdDSA"], issuer=issued["issuer_did"])
+        self.assertEqual(legacy_list["vc"]["id"], status_url)
+        self.assertEqual(legacy_list["vc"]["credentialSubject"], revoked_subject)
 
     # -----------------------------------------------------------------
     # 시나리오 2: 비정상 요청 / 인증 실패의 예외 처리와 실패 로그

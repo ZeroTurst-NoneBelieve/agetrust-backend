@@ -1,12 +1,16 @@
 """최초 성인 인증 결과 기록, VC 발급 및 DID Document 조회."""
 
-import random
+import hashlib
+import json
+import re
+import secrets
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_kiosk, get_current_user
 from app.config import settings
 from app.core.audit import record_audit_event
 from app.core.status_list import (
@@ -15,6 +19,7 @@ from app.core.status_list import (
     PURPOSE_REVOCATION,
     build_credential_status,
     build_status_list_url,
+    decode_bitstring,
     empty_encoded_list,
 )
 from app.core.vc import (
@@ -28,11 +33,12 @@ from app.models import (
     AdultVerification,
     CredentialStatusList,
     Device,
+    Kiosk,
     User,
     VcCredential,
 )
 from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
-from app.schemas.errors import AdultVerificationStatus
+from app.schemas.errors import AdultVerificationStatus, AuthErrorResponse
 from app.schemas.vc import (
     AdultVerificationRequest,
     AdultVerificationResponse,
@@ -42,12 +48,40 @@ from app.schemas.vc import (
 
 router = APIRouter(prefix="/api/v1", tags=["did-vc"])
 
-# 상태 목록 생성 구간을 감싸는 advisory lock 키.
+# 상태 목록 생성 및 인덱스 배정을 직렬화하는 advisory lock 키.
 # 목록이 아직 하나도 없을 때는 잠글 행 자체가 없어서 with_for_update를 걸 수
 # 없다. PostgreSQL의 트랜잭션 단위 advisory lock은 행이 없어도 "이름"에
 # 자물쇠를 걸 수 있어, 첫 발급이 동시에 들어와도 목록이 두 개 생기지 않는다.
+# 사용 여부 확인부터 VC INSERT·commit까지 유지해야 같은 빈자리의 중복
+# 배정도 막는다. 생성 직후 잠금을 풀거나 기존 목록에서 생략하면 안 된다.
 # 값 자체에 의미는 없고 다른 용도와 겹치지 않기만 하면 된다.
 _STATUS_LIST_LOCK_KEY = 27_0001
+_INDEX_PICK_ATTEMPTS = 32
+
+
+async def _index_is_taken(db: AsyncSession, status_list_id: int, index: int) -> bool:
+    """폐기·만료된 VC의 자리도 재사용하지 않는다."""
+    return bool(await db.scalar(select(exists().where(
+        VcCredential.status_list_id == status_list_id,
+        VcCredential.status_list_index == index,
+    ))))
+
+
+async def _pick_unused_index(db: AsyncSession, status_list_id: int) -> int:
+    """무작위 재시도 소진 시 실제 빈자리 중 하나를 무작위로 고른다.
+
+    재시도 실패가 목록이 가득 찼다는 뜻은 아니다. 드문 fallback 경로에서만
+    최대 131,072개의 자리를 훑어, 빈자리가 있는데 확률적으로 503을 내지 않는다.
+    호출부의 advisory lock이 VC 저장까지 유지되는 것을 전제로 한다.
+    """
+    result = await db.execute(select(VcCredential.status_list_index).where(
+        VcCredential.status_list_id == status_list_id,
+    ))
+    taken = set(result.scalars().all())
+    available = [index for index in range(BITSTRING_SIZE) if index not in taken]
+    if not available:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="status list is full")
+    return secrets.choice(available)
 
 
 async def _allocate_status_list_entry(
@@ -95,9 +129,13 @@ async def _allocate_status_list_entry(
             detail="status list is full",
         )
 
-    # 남은 자리가 압도적으로 많으므로 그냥 하나 고른다. 충돌은 advisory lock과
-    # UNIQUE(status_list_id, status_list_index)가 막는다.
-    next_index = random.randrange(BITSTRING_SIZE)
+    # 잠금은 동시 배정만 막는다. 이미 쓰인 후보는 직접 확인하고 다시 뽑는다.
+    for _ in range(_INDEX_PICK_ATTEMPTS):
+        next_index = secrets.randbelow(BITSTRING_SIZE)
+        if not await _index_is_taken(db, status_list.id, next_index):
+            break
+    else:
+        next_index = await _pick_unused_index(db, status_list.id)
 
     return status_list, next_index
 
@@ -346,8 +384,39 @@ async def issue_credential(
     )
 
 
+def _status_list_etag(status_list: CredentialStatusList) -> str:
+    # iat는 매 응답마다 바뀌므로 weak ETag를 쓴다. 버전뿐 아니라 URL 복구나
+    # 발급자 키 변경도 반영해 이전 JWT를 잘못 304로 재검증하지 않는다.
+    representation = json.dumps([
+        ISSUER_DID,
+        status_list.status_list_url,
+        status_list.status_purpose,
+        status_list.encoded_list,
+    ], ensure_ascii=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(representation.encode()).hexdigest()
+    return f'W/"{status_list.id}-{status_list.version}-{fingerprint}"'
+
+
+def _etag_matches(if_none_match: list[str] | None, etag: str) -> bool:
+    """If-None-Match는 weak 비교를 사용한다 (RFC 9110 §13.1.2)."""
+    if not if_none_match:
+        return False
+    value = ",".join(if_none_match).strip()
+    if value == "*":
+        return True
+    # opaque-tag 안의 쉼표를 구분자로 오인하지 않는다. 잘못된 헤더는 무시한다.
+    tag_pattern = r'(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"'
+    if not re.fullmatch(rf'\s*{tag_pattern}(?:\s*,\s*{tag_pattern})*\s*', value):
+        return False
+    return any(
+        tag.removeprefix("W/") == etag.removeprefix("W/")
+        for tag in re.findall(tag_pattern, value)
+    )
+
+
+@router.get("/status/{status_list_id}", response_class=Response, include_in_schema=False)
 @router.get(
-    "/status/{status_list_id}",
+    "/status-lists/{status_list_id}",
     summary="StatusList2021 폐기 목록 조회",
     response_class=Response,
     responses={
@@ -358,23 +427,34 @@ async def issue_credential(
             ),
             "content": {"application/jwt": {"schema": {"type": "string"}}},
         },
+        304: {"description": "If-None-Match와 일치하며 목록이 변경되지 않음"},
+        401: {
+            "description": "키오스크 키가 없거나 잘못됨 또는 키오스크가 비활성/폐기 상태임",
+            "model": AuthErrorResponse,
+        },
         404: {"description": "해당 상태 목록이 없음"},
-        503: {"description": "상태 목록이 비어 있어 신뢰할 수 있는 응답을 만들 수 없음"},
+        503: {"description": "상태 목록이 비어 있거나 손상되어 응답할 수 없음"},
     },
 )
 async def get_status_list(
     status_list_id: int,
     db: AsyncSession = Depends(get_db),
+    if_none_match: Annotated[list[str] | None, Header()] = None,
+    _kiosk: Kiosk = Depends(get_current_kiosk),
 ):
     """VC 폐기 목록을 서명된 StatusList2021Credential로 반환한다.
 
-    키오스크가 호출하므로 로그인 인증이 필요 없는 공개 엔드포인트다.
+    X-Kiosk-Key로 등록된 ACTIVE 키오스크만 조회할 수 있다. 목록 조회와
+    조건부 304 처리보다 먼저 인증한다. 키 발급/배포와 최종 헤더 계약의
+    팀 확인 사항은 docs/status-list-review.md에 기록한다.
     발급된 VC의 credentialStatus.statusListCredential이 이 주소를 가리킨다.
+    기존 VC의 /status/{id} 주소도 동일한 인증을 거치는 호환 별칭으로 유지한다.
 
     키오스크는 "이 VC 유효한가?"를 한 건씩 묻지 않고 목록 전체를 받아간다.
     개별 조회 방식이면 서버가 누가 언제 어디서 인증을 시도했는지 모두 알게
     되기 때문이다. 목록에는 13만 개의 비트가 함께 들어 있어 어느 VC를
-    확인하는지 서버가 알 수 없다.
+    확인하는지 목록 조회만으로 특정할 수 없다. 일괄 조회의 프라이버시 이점은
+    API Key 인증 유무와 별개다.
 
     응답은 발급자 키로 서명된 JWT다. 서명이 없으면 중간에서 전부 0인 목록으로
     바꿔치기해 폐기된 VC를 되살릴 수 있다.
@@ -384,18 +464,33 @@ async def get_status_list(
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             detail="status list not found",
+            headers={"Cache-Control": "no-store"},
         )
 
-    if not status_list.encoded_list:
+    try:
         # 전부 0인 목록으로 대신 응답하면 안 된다. 그 서명은 "폐기된 VC가
         # 하나도 없다"는 발급자의 보증이라, 저장된 값이 손상된 경우에도
         # 폐기된 VC를 키오스크에서 되살리게 된다.
-        # 목록은 생성 시점에 채워지므로 여기가 비어 있으면 정상이 아니다.
-        # 잘못된 보증을 하느니 조회를 실패시킨다.
+        # 비어 있지 않아도 gzip이나 길이가 잘못되면 서명·304 모두 금지한다.
+        if not status_list.encoded_list:
+            raise ValueError("empty status list")
+        decode_bitstring(status_list.encoded_list)
+    except ValueError as error:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="status list is not available",
-        )
+            headers={"Cache-Control": "no-store"},
+        ) from error
+
+    headers = {
+        # 공유 캐시는 저장하지 않고, HTTP 캐시 재사용도 서버 인증/재검증을
+        # 거친다. 키오스크 앱의 별도 오프라인 저장·검증 정책과는 구분한다.
+        "Cache-Control": "private, no-cache",
+        "Vary": "X-Kiosk-Key",
+        "ETag": _status_list_etag(status_list),
+    }
+    if _etag_matches(if_none_match, headers["ETag"]):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
 
     token = issue_status_list_vc(
         status_list_url=status_list.status_list_url,
@@ -411,12 +506,7 @@ async def get_status_list(
     return Response(
         content=token,
         media_type="application/jwt",
-        headers={
-            # 폐기 반영이 늦어지는 만큼이 위험 구간이므로 짧게 잡는다.
-            "Cache-Control": "public, max-age=300",
-            # 목록이 그대로면 키오스크가 본문을 다시 받지 않아도 된다.
-            "ETag": f'W/"{status_list_id}-{status_list.version}"',
-        },
+        headers=headers,
     )
 
 

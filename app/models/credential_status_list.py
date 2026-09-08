@@ -23,4 +23,6 @@ class CredentialStatusList(Base):
     status_list_url: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     encoded_list: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="1")
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
