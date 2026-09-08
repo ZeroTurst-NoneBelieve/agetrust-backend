@@ -195,7 +195,9 @@ class VcRouteTests(unittest.TestCase):
         response = self._get("/api/v1/did/did:web:example.com")
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("only did:key", response.json()["detail"])
+        detail = response.json()["detail"]
+        self.assertEqual(detail["code"], "INVALID_DID_FORMAT")
+        self.assertIn("only did:key", detail["message"])
 
 
 class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -240,7 +242,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             await record_adult_verification(body, self.user, db)
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(raised.exception.detail, {"code": "DEVICE_NOT_ACTIVE"})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_rejects_invalidated_verification(self):
@@ -259,7 +261,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(
             raised.exception.detail,
-            "adult verification was invalidated",
+            {"code": "VERIFICATION_INVALIDATED"},
         )
         self.assertEqual(db.commits, 0)
 
@@ -288,7 +290,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             await issue_credential(IssueVcRequest(adult_verification_id=3), self.user, db)
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(raised.exception.detail, {"code": "DEVICE_NOT_ACTIVE"})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_persists_signed_expiration(self):

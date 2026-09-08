@@ -80,5 +80,59 @@ class OpenApiContractTests(unittest.TestCase):
         self.assertEqual(code["$ref"], "#/components/schemas/AuthError")
 
 
+    def test_vc_error_responses_expose_detail_code_schema(self):
+        responses = (
+            ("/api/v1/adult-verifications", "post", "400"),
+            ("/api/v1/adult-verifications", "post", "404"),
+            ("/api/v1/did/issue", "post", "400"),
+            ("/api/v1/did/issue", "post", "404"),
+            ("/api/v1/did/{did}", "get", "400"),
+            ("/api/v1/auth/devices/bind-holder-key", "post", "400"),
+            ("/api/v1/auth/devices/bind-holder-key", "post", "404"),
+        )
+
+        for path, method, status_code in responses:
+            with self.subTest(path=path, status_code=status_code):
+                schema = self.openapi["paths"][path][method]["responses"][status_code][
+                    "content"
+                ]["application/json"]["schema"]
+                self.assertEqual(
+                    schema["$ref"],
+                    "#/components/schemas/VcErrorResponse",
+                )
+
+        detail = self.schemas["VcErrorResponse"]["properties"]["detail"]
+        code = self.schemas["VcErrorDetail"]["properties"]["code"]
+        self.assertEqual(detail["$ref"], "#/components/schemas/VcErrorDetail")
+        self.assertEqual(code["$ref"], "#/components/schemas/VcError")
+
+    def test_documented_errors_never_return_a_bare_string_body(self):
+        """에러 본문이 다시 평문 문자열로 돌아가지 않도록 잠근다(#38).
+
+        문서화한 4xx·5xx는 전부 detail.code 형태여야 한다. 422는 FastAPI가
+        요청 검증용으로 직접 만드는 응답이라 제외한다.
+        """
+        allowed = {
+            "#/components/schemas/AuthErrorResponse",
+            "#/components/schemas/VcErrorResponse",
+        }
+        offenders = []
+
+        for path, methods in self.openapi["paths"].items():
+            for method, operation in methods.items():
+                for status_code, response in operation.get("responses", {}).items():
+                    if status_code[0] not in "45" or status_code == "422":
+                        continue
+                    schema = (
+                        response.get("content", {})
+                        .get("application/json", {})
+                        .get("schema", {})
+                    )
+                    if schema.get("$ref") not in allowed:
+                        offenders.append(f"{status_code} {method.upper()} {path}")
+
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main()
