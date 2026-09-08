@@ -14,7 +14,13 @@ class Settings(BaseSettings):
     # 체인에 등록한 공개키와도 어긋나므로 반드시 고정 값을 쓴다.
     issuer_private_key: str
 
+    # 루트 로거 레벨 (#39). API와 Publisher 워커가 같이 쓴다.
+    # DEBUG로 내리면 SQLAlchemy 등 라이브러리 로그까지 나온다.
+    log_level: str = "INFO"
+
     # Kafka — outbox_events를 바깥으로 발행하는 통로 (설계서 14 / REQ-INF-002).
+    # Publisher는 별도 프로세스(app/workers/publisher.py)로 돈다. 띄울지 말지는
+    # 설정값이 아니라 그 프로세스를 실행하느냐로 정한다.
     # 시크릿이 아니라 배포 환경마다 달라지는 주소·이름이므로 기본값을 둔다.
     kafka_bootstrap_servers: str = "kafka:29092"
     kafka_audit_topic: str = "agetrust.audit-events"
@@ -27,8 +33,6 @@ class Settings(BaseSettings):
     # 한도에 도달하면 ERROR 로그가 남는다. 감사 원장(audit_logs)에는 그대로
     # 남아 있고 Kafka 구독자에게만 전달되지 않는다.
     outbox_max_retry_count: int = 10
-    # 로컬에서 Kafka 없이 API만 띄우고 싶을 때 끈다.
-    kafka_publisher_enabled: bool = True
 
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30

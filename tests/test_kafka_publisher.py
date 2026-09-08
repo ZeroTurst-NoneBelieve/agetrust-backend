@@ -16,7 +16,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
-from sqlalchemy.exc import IntegrityError  # noqa: E402
+from sqlalchemy.exc import IntegrityError, OperationalError  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.core.kafka_publisher import (  # noqa: E402
@@ -156,6 +156,17 @@ class BackfillFailureTests(unittest.IsolatedAsyncioTestCase):
         db = FakeOutboxDb([_event()])
         await publish_pending_once(db, FakeProducer())
         self.assertEqual(db.savepoints, 1)
+
+    async def test_operational_error_does_not_cancel_publication(self):
+        """#39 — 유니크 충돌이 아닌 DB 오류도 발행 성공을 되돌리면 안 된다."""
+        events = [_event(index=0), _event(index=1)]
+        reset = OperationalError("UPDATE audit_logs", {}, Exception("connection reset"))
+        db = FakeOutboxDb(events, backfill_error=reset)
+        producer = FakeProducer()
+
+        self.assertEqual(await publish_pending_once(db, producer), 2)
+        self.assertIsNotNone(events[0].published_at)
+        self.assertEqual(db.commits, 1, "좌표 기록 실패가 커밋을 막았다")
 
 
 class PublishFailureTests(unittest.IsolatedAsyncioTestCase):
