@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.api import api_router
-from app.config import settings
+from app.config import log_defaulted_settings, settings
 from app.core.kafka_publisher import run_publisher_loop
 from app.database import AsyncSessionLocal
 
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """앱과 수명을 같이하는 Outbox Publisher를 띄운다 (설계서 14 / REQ-INF-002)."""
+    log_defaulted_settings(settings)
     stop_event = asyncio.Event()
     publisher = None
 
