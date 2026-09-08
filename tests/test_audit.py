@@ -291,7 +291,7 @@ class LoginAuditTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BindHolderKeyAuditTests(unittest.IsolatedAsyncioTestCase):
-    """#22 재바인딩이 감사 로그에 남는지 (#9와 접점)."""
+    """재바인딩이 감사 로그에 남는지 (#22 / #9 접점, #27에서 비트 수 추가)."""
 
     @staticmethod
     def _key_material(device_id):
@@ -307,14 +307,24 @@ class BindHolderKeyAuditTests(unittest.IsolatedAsyncioTestCase):
         return pem, signature, public_key_to_did_key(public_key)
 
     async def test_rebinding_records_revoked_count(self):
-        from app.models import Device
+        from app.core.status_list import empty_encoded_list
+        from app.models import CredentialStatusList, Device
 
         pem, signature, new_did = self._key_material(2)
         device = SimpleNamespace(
             id=2, user_id=1, status="ACTIVE",
             holder_did="did:key:zOldKeyFromLostPhone", holder_public_key=None,
         )
-        db = FakeDb({(Device, 2): device}, rowcount=3)
+        status_list = SimpleNamespace(
+            id=7, encoded_list=empty_encoded_list(), version=1
+        )
+        # 폐기 건수는 UPDATE ... RETURNING이 돌려준 행으로 센다(#27).
+        # 상태 목록 배정이 있는 VC 2건 + 배정 전에 발급된 VC 1건.
+        db = FakeDb(
+            {(Device, 2): device},
+            scalar_results={CredentialStatusList: status_list},
+            returning_rows=[(7, 3), (7, 5), (None, None)],
+        )
 
         await bind_holder_key(
             BindHolderKeyRequest(
@@ -328,6 +338,9 @@ class BindHolderKeyAuditTests(unittest.IsolatedAsyncioTestCase):
         event = db.audit_logs[0]
         self.assertEqual(event.event_type, "HOLDER_KEY_REBOUND")
         self.assertEqual(event.payload["revoked_vc_count"], 3)
+        # 배정이 없던 1건은 켤 비트가 없다. 두 값이 갈리는 것 자체가
+        # 사후 조사에 필요한 정보다.
+        self.assertEqual(event.payload["revoked_status_list_bits"], 2)
         self.assertEqual(event.payload["previous_holder_did"], "did:key:zOldKeyFromLostPhone")
         self.assertEqual(event.payload["new_holder_did"], new_did)
 
@@ -350,3 +363,4 @@ class BindHolderKeyAuditTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(db.audit_logs[0].event_type, "HOLDER_KEY_BOUND")
         self.assertEqual(db.audit_logs[0].payload["revoked_vc_count"], 0)
+        self.assertEqual(db.audit_logs[0].payload["revoked_status_list_bits"], 0)

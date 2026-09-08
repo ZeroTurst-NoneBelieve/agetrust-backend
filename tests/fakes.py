@@ -7,6 +7,9 @@
 
 from app.models import AuditLog, OutboxEvent
 
+# "주입된 값이 없음"과 "주입된 값이 None"을 구분하기 위한 표식.
+_MISSING = object()
+
 
 class FakeResult:
     def __init__(self, rows=None, rowcount=0, scalar=None):
@@ -31,11 +34,30 @@ class FakeDb:
     - `audit_logs`    : 기록된 AuditLog 행
     - `outbox_events` : 기록된 OutboxEvent 행
     - `chain_tip`     : 마지막 AuditLog의 event_hash (해시 체인 tip)
+
+    select 결과는 두 갈래로 준다.
+
+    - `scalar_results` : {모델: 돌려줄 값}. select(Model) 형태의 조회에 쓴다.
+    - `scalar_default` : 위에 걸리지 않는 집계 쿼리(MAX+1 등)의 반환값.
+    - `returning_rows` : UPDATE ... RETURNING이 돌려줄 행.
     """
 
-    def __init__(self, rows=None, *, rowcount=0, scalar_results=None):
+    def __init__(
+        self,
+        rows=None,
+        *,
+        rowcount=0,
+        scalar_results=None,
+        scalar_default=0,
+        returning_rows=None,
+    ):
         self.rows = rows or {}
         self.scalar_results = scalar_results or {}
+        # 엔티티 대역이 걸리지 않는 집계 쿼리(MAX+1, COUNT 등)의 기본 반환값.
+        self.scalar_default = scalar_default
+        # UPDATE ... RETURNING이 돌려줄 행. 폐기된 VC의 상태 목록 배정을
+        # 흉내내는 데 쓴다.
+        self.returning_rows = list(returning_rows or [])
         self.scalar_query_hits = {}
         self.added = []
         self.executed = []
@@ -68,22 +90,46 @@ class FakeDb:
                 row.id = self._next_id
                 self._next_id += 1
 
-    async def execute(self, statement, params=None):
-        text = self._render(statement)
+    @staticmethod
+    def _selected_entities(statement):
+        """select(Model) 형태로 조회하는 엔티티만 골라낸다.
 
-        # select(Model) 결과를 ORM 엔티티 기준으로 주입한다. 렌더된 SQL 문자열에
-        # 의존하지 않으므로 쿼리 포맷이 바뀌어도 의도한 테스트 대역이 동작한다.
-        entities = {
-            description.get("entity")
+        select(func.max(Model.col))처럼 컬럼을 가공하는 쿼리도
+        column_descriptions에 entity가 붙어 나온다. 이 둘을 구분하지 않으면
+        집계 쿼리에 엔티티 대역이 잘못 주입된다. expr이 엔티티 자신일 때만
+        "행을 통째로 가져오는 조회"로 본다.
+        """
+        return {
+            description["entity"]
             for description in getattr(statement, "column_descriptions", [])
             if description.get("entity") is not None
+            and description.get("expr") is description["entity"]
         }
+
+    def _injected_scalar(self, statement):
+        """statement가 대역을 주입해 둔 엔티티를 향하면 그 값을 돌려준다.
+
+        렌더된 SQL 문자열이 아니라 ORM 엔티티로 판단하므로, 쿼리 포맷이
+        바뀌어도 의도한 대역이 그대로 동작한다.
+        찾지 못하면 _MISSING을 돌려주어 "주입값 없음"과 "주입값이 None"을
+        구분한다.
+        """
+        entities = self._selected_entities(statement)
         for entity, scalar_result in self.scalar_results.items():
             if entity in entities:
                 self.scalar_query_hits[entity] = self.scalar_query_hits.get(entity, 0) + 1
-                return FakeResult(scalar=scalar_result)
+                return scalar_result
+        return _MISSING
 
-        # 감사 체인 append 구간을 직렬화하는 자문 잠금.
+    async def execute(self, statement, params=None):
+        text = self._render(statement)
+
+        # select(Model) 결과를 ORM 엔티티 기준으로 주입한다.
+        injected = self._injected_scalar(statement)
+        if injected is not _MISSING:
+            return FakeResult(scalar=injected)
+
+        # 감사 체인 append 구간과 상태 목록 배정 구간을 직렬화하는 자문 잠금.
         if "pg_advisory_xact_lock" in text:
             return FakeResult()
 
@@ -92,10 +138,27 @@ class FakeDb:
             return FakeResult(scalar=self.chain_tip)
 
         self.executed.append(statement)
+        if "RETURNING" in text.upper():
+            return FakeResult(
+                rows=self.returning_rows, rowcount=len(self.returning_rows)
+            )
         return FakeResult(rowcount=self._rowcount)
 
     async def scalar(self, statement):
-        return 0
+        """execute()와 같은 규칙으로 주입값을 돌려준다.
+
+        select(Model)은 주입된 엔티티 대역을, 집계 쿼리(MAX+1 등)는
+        scalar_default를 돌려준다. 예전에는 무조건 0을 돌려주었는데,
+        엔티티를 기대하는 호출에도 0이 넘어가 프로덕션 코드가 정수에
+        속성 접근을 시도하다 터졌다.
+        """
+        injected = self._injected_scalar(statement)
+        if injected is not _MISSING:
+            return injected
+        if self._selected_entities(statement):
+            # 대역을 주지 않은 엔티티 조회는 "행이 없음"으로 본다.
+            return None
+        return self.scalar_default
 
     async def commit(self):
         self.commits += 1

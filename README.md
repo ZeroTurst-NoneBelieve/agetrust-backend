@@ -113,7 +113,8 @@ ruff 버전은 `requirements-dev.txt`와 워크플로 양쪽에 고정돼 있습
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-E2E 3건(`tests/test_e2e_scenarios.py`)은 `E2E_DATABASE_URL`이 있을 때만 실행되고, 없으면 조용히 스킵됩니다. 켜려면:
+E2E 3건(`tests/test_e2e_scenarios.py`)과 상태 목록 PostgreSQL 회귀 테스트 4건
+(`tests/test_status_list_db.py`)은 `E2E_DATABASE_URL`이 있을 때만 실행되고, 없으면 스킵됩니다. 켜려면:
 
 ```bash
 # macOS / Linux
@@ -128,6 +129,14 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 E2E는 테이블에 실제로 쓰기를 하므로 운영 DB를 가리키지 마세요.
+
+상태 목록은 `Authorization: Bearer <api_key>`로 등록된 ACTIVE 키오스크만
+조회할 수 있습니다. 기존 `/api/v1/status/{id}` 경로에도 같은 인증이 필요합니다.
+API Key 원문만 보내며 사용자 로그인 JWT나 `식별자:키` 형식이 아닙니다.
+이전 `X-Kiosk-Key` 방식은 지원하지 않습니다. URL 호환성, 캐시 동작, 키 배포 후속 범위는
+[#27 리뷰 반영 범위](docs/status-list-review.md)를 참고하세요.
+키오스크 K-6 담당자와 연동할 때는
+[폐기 목록 연동 안내](docs/status-list-kiosk-handoff.md)를 참고하세요.
 
 ## 7. CI
 

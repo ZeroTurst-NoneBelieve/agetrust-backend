@@ -55,7 +55,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql+asyncpg://agetrust:agetrust@localhost:5432/agetrust_test
-      # E2E는 전용 변수가 있을 때만 켜진다. 없으면 3건이 조용히 스킵된다.
+      # E2E 및 PostgreSQL 회귀 테스트는 전용 변수가 있을 때만 켜진다.
       E2E_DATABASE_URL: postgresql+asyncpg://agetrust:agetrust@localhost:5432/agetrust_test
       # 테스트 전용 더미 값이다. 실제 키를 Secrets에 넣을 필요가 없다.
       # ISSUER_PRIVATE_KEY는 base64(0..31 바이트)로, 테스트가 쓰는 값과 같다.
