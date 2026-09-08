@@ -36,6 +36,49 @@ class AuthErrorResponse(BaseModel):
     detail: AuthErrorDetail
 
 
+class VcError(StrEnum):
+    """기기 · 성인 인증 판정 · VC 발급 · 폐기 목록 경로의 오류 코드.
+
+    holder 키 바인딩(POST /api/v1/auth/devices/bind-holder-key)은 라우트가 auth
+    아래에 있지만, holder_did를 정하는 VC 발급의 선행 단계라 이 사전에 함께 둔다.
+
+    STATUS_LIST_* 는 폐기 목록(#27) 경로다. 조회 주체가 사용자가 아니라
+    키오스크라 소비자는 다르지만, 발급된 VC의 credentialStatus가 가리키는
+    같은 VC 도메인이라 사전을 나누지 않는다.
+    """
+
+    DEVICE_NOT_FOUND = "DEVICE_NOT_FOUND"
+    DEVICE_NOT_ACTIVE = "DEVICE_NOT_ACTIVE"
+    HOLDER_DID_NOT_BOUND = "HOLDER_DID_NOT_BOUND"
+    HOLDER_KEY_PROOF_FAILED = "HOLDER_KEY_PROOF_FAILED"
+    VERIFICATION_NOT_FOUND = "VERIFICATION_NOT_FOUND"
+    VERIFICATION_NOT_SUCCESSFUL = "VERIFICATION_NOT_SUCCESSFUL"
+    VERIFICATION_INVALIDATED = "VERIFICATION_INVALIDATED"
+    INVALID_DID_FORMAT = "INVALID_DID_FORMAT"
+    # 목록 13만 자리가 모두 찼다. 다음 목록 자동 생성은 후속 작업이다.
+    STATUS_LIST_FULL = "STATUS_LIST_FULL"
+    STATUS_LIST_NOT_FOUND = "STATUS_LIST_NOT_FOUND"
+    # 저장된 encoded_list가 비었거나 손상됐다. 전부 0인 목록으로 대신
+    # 응답하면 폐기된 VC가 되살아나므로 서명하지 않고 거부한다.
+    STATUS_LIST_UNAVAILABLE = "STATUS_LIST_UNAVAILABLE"
+
+
+class VcErrorDetail(BaseModel):
+    """기기 · VC 오류 상세."""
+
+    code: VcError = Field(description="클라이언트가 분기할 수 있는 오류 코드.")
+    message: str | None = Field(
+        default=None,
+        description="코드로 표현할 수 없는 진단 정보(예: DID 파싱 실패 사유). 분기 근거로 쓰지 않는다.",
+    )
+
+
+class VcErrorResponse(BaseModel):
+    """FastAPI HTTPException의 기기 · VC 오류 응답."""
+
+    detail: VcErrorDetail
+
+
 class AdultVerificationStatus(StrEnum):
     SUCCESS = "SUCCESS"
     FAIL_AGE = "FAIL_AGE"

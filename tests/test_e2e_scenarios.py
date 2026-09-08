@@ -616,6 +616,7 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             json={"adult_verification_id": failed_verification_id},
         )
         self.assertEqual(r.status_code, 400, "실패한 인증으로 VC가 발급되면 안 된다")
+        self.assertEqual(r.json()["detail"]["code"], "VERIFICATION_NOT_SUCCESSFUL")
 
         # 2-5) 존재하지 않는 인증 id -> 404
         r = await self.client.post(
@@ -623,6 +624,7 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             json={"adult_verification_id": 999_999_999},
         )
         self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "VERIFICATION_NOT_FOUND")
 
         # 2-6) 남의 인증 id로 발급 시도 -> 404 (소유자 검증)
         _other_id, _other_login, other_auth = await self._signed_up_user()
@@ -642,6 +644,7 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             json={"adult_verification_id": others_verification_id},
         )
         self.assertEqual(r.status_code, 404, "남의 인증으로 VC가 발급되면 안 된다")
+        self.assertEqual(r.json()["detail"]["code"], "VERIFICATION_NOT_FOUND")
 
         # 2-7) 토큰 없이 보호된 엔드포인트 -> 401
         r = await self.client.get("/api/v1/auth/me")
