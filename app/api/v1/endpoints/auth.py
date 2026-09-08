@@ -9,7 +9,7 @@ import base64
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,7 +38,7 @@ from app.schemas.audit import (
     AuditEventType,
 )
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
-from app.schemas.errors import AuthError, AuthErrorResponse
+from app.schemas.errors import AuthError, AuthErrorResponse, VcError
 from app.schemas.user import (
     LoginRequest,
     PhoneRequestBody,
@@ -480,13 +480,13 @@ async def bind_holder_key(
     # 그 VC는 폐기 목록에도 없어 분실 기기가 키오스크를 그대로 통과한다.
     device = await db.get(Device, body.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
 
     try:
         pub = load_public_key_pem(body.holder_public_key_pem)
         pub.verify(base64.b64decode(body.proof_signature_b64), str(body.device_id).encode())
     except Exception:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="key ownership proof failed")
+        raise api_error(VcError.HOLDER_KEY_PROOF_FAILED, status.HTTP_400_BAD_REQUEST)
 
     new_holder_did = public_key_to_did_key(pub)
 

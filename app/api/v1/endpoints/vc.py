@@ -11,6 +11,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_kiosk, get_current_user
+from app.api.errors import api_error
 from app.config import settings
 from app.core.audit import record_audit_event
 from app.core.status_list import (
@@ -38,7 +39,7 @@ from app.models import (
     VcCredential,
 )
 from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
-from app.schemas.errors import AdultVerificationStatus, AuthErrorResponse
+from app.schemas.errors import AdultVerificationStatus, AuthErrorResponse, VcError
 from app.schemas.vc import (
     AdultVerificationRequest,
     AdultVerificationResponse,
@@ -191,12 +192,9 @@ async def record_adult_verification(
     """
     device = await db.get(Device, body.device_id)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if device.status != "ACTIVE":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device is not active",
-        )
+        raise api_error(VcError.DEVICE_NOT_ACTIVE, status.HTTP_400_BAD_REQUEST)
 
     if not body.age_check_passed:
         result_status, failure_code = (
@@ -292,20 +290,11 @@ async def issue_credential(
     """
     verification = await db.get(AdultVerification, body.adult_verification_id)
     if verification is None or verification.user_id != user.id:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            detail="verification not found",
-        )
+        raise api_error(VcError.VERIFICATION_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if verification.result_status != AdultVerificationStatus.SUCCESS.value:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="adult verification was not successful",
-        )
+        raise api_error(VcError.VERIFICATION_NOT_SUCCESSFUL, status.HTTP_400_BAD_REQUEST)
     if verification.invalidated_at is not None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="adult verification was invalidated",
-        )
+        raise api_error(VcError.VERIFICATION_INVALIDATED, status.HTTP_400_BAD_REQUEST)
 
     # 재바인딩(POST /auth/devices/bind-holder-key)과 같은 기기 행을 잠가 두
     # 요청을 직렬화한다. 잠금이 없으면 여기서 읽은 holder_did가 아래에서 VC를
@@ -314,17 +303,11 @@ async def issue_credential(
     # 기기가 키오스크를 그대로 통과한다.
     device = await db.get(Device, verification.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if device.status != "ACTIVE":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device is not active",
-        )
+        raise api_error(VcError.DEVICE_NOT_ACTIVE, status.HTTP_400_BAD_REQUEST)
     if not device.holder_did:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device has no holder_did. Register device and bind holder key first.",
-        )
+        raise api_error(VcError.HOLDER_DID_NOT_BOUND, status.HTTP_400_BAD_REQUEST)
 
     # 상태 목록의 자리를 먼저 잡아야 VC 본문에 credentialStatus를 실을 수 있다.
     # did:key VC는 자기완결적이라 키오스크가 서버에 묻지 않고 검증하는데,
@@ -543,7 +526,10 @@ async def resolve_did_document(did: str):
     try:
         return build_did_document(did)
     except ValueError as error:
-        raise HTTPException(
+        # 파싱 실패 사유는 코드 하나로 뭉뚱그릴 수 없어 message로 함께 내려보낸다.
+        # 분기는 code로 하고, message는 어디가 틀렸는지 사람이 읽는 용도다.
+        raise api_error(
+            VcError.INVALID_DID_FORMAT,
             status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            message=str(error),
         ) from error
