@@ -39,7 +39,12 @@ from app.models import (
     VcCredential,
 )
 from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
-from app.schemas.errors import AdultVerificationStatus, AuthErrorResponse, VcError
+from app.schemas.errors import (
+    AdultVerificationStatus,
+    AuthErrorResponse,
+    VcError,
+    VcErrorResponse,
+)
 from app.schemas.vc import (
     AdultVerificationRequest,
     AdultVerificationResponse,
@@ -171,8 +176,14 @@ async def _create_status_list(db: AsyncSession) -> CredentialStatusList:
     response_model=AdultVerificationResponse,
     summary="온디바이스 성인 판정 결과 기록",
     responses={
-        400: {"description": "기기가 ACTIVE 상태가 아님"},
-        404: {"description": "기기를 찾을 수 없거나 본인 소유가 아님"},
+        400: {
+            "model": VcErrorResponse,
+            "description": "기기가 ACTIVE 상태가 아님 (DEVICE_NOT_ACTIVE)",
+        },
+        404: {
+            "model": VcErrorResponse,
+            "description": "기기를 찾을 수 없거나 본인 소유가 아님 (DEVICE_NOT_FOUND)",
+        },
     },
 )
 async def record_adult_verification(
@@ -260,12 +271,21 @@ async def record_adult_verification(
     summary="성인 인증 VC 발급",
     responses={
         400: {
+            "model": VcErrorResponse,
             "description": (
-                "판정이 SUCCESS가 아니거나 무효화됨 / "
-                "기기가 ACTIVE가 아님 / holder_did 미등록"
-            )
+                "판정이 SUCCESS가 아니거나(VERIFICATION_NOT_SUCCESSFUL) "
+                "무효화됨(VERIFICATION_INVALIDATED) / "
+                "기기가 ACTIVE가 아님(DEVICE_NOT_ACTIVE) / "
+                "holder_did 미등록(HOLDER_DID_NOT_BOUND)"
+            ),
         },
-        404: {"description": "판정 기록 또는 기기를 찾을 수 없거나 본인 소유가 아님"},
+        404: {
+            "model": VcErrorResponse,
+            "description": (
+                "판정 기록(VERIFICATION_NOT_FOUND) 또는 "
+                "기기(DEVICE_NOT_FOUND)를 찾을 수 없거나 본인 소유가 아님"
+            ),
+        },
     },
 )
 async def issue_credential(
@@ -513,7 +533,15 @@ async def get_issuer_did_document():
 @router.get(
     "/did/{did}",
     summary="did:key DID Document 해석",
-    responses={400: {"description": "did:key 형식이 아니거나 파싱할 수 없는 DID"}},
+    responses={
+        400: {
+            "model": VcErrorResponse,
+            "description": (
+                "did:key 형식이 아니거나 파싱할 수 없는 DID (INVALID_DID_FORMAT). "
+                "실패 사유는 detail.message에 담긴다."
+            ),
+        },
+    },
 )
 async def resolve_did_document(did: str):
     """did:key DID를 공개키가 포함된 DID Document로 해석한다.

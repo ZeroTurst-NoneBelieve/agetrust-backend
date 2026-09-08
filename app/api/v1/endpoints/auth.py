@@ -38,7 +38,7 @@ from app.schemas.audit import (
     AuditEventType,
 )
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
-from app.schemas.errors import AuthError, AuthErrorResponse, VcError
+from app.schemas.errors import AuthError, AuthErrorResponse, VcError, VcErrorResponse
 from app.schemas.user import (
     LoginRequest,
     PhoneRequestBody,
@@ -455,8 +455,14 @@ async def register_device(
     response_model=DeviceResponse,
     summary="Holder 공개키 바인딩",
     responses={
-        400: {"description": "소유 증명 서명 검증 실패"},
-        404: {"description": "기기를 찾을 수 없거나 본인 소유가 아님"},
+        400: {
+            "model": VcErrorResponse,
+            "description": "소유 증명 서명 검증 실패 (HOLDER_KEY_PROOF_FAILED)",
+        },
+        404: {
+            "model": VcErrorResponse,
+            "description": "기기를 찾을 수 없거나 본인 소유가 아님 (DEVICE_NOT_FOUND)",
+        },
     },
 )
 async def bind_holder_key(
