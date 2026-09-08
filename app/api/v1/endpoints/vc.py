@@ -11,7 +11,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_kiosk, get_current_user
-from app.api.errors import api_error
+from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import record_audit_event
 from app.core.status_list import (
@@ -173,6 +173,7 @@ async def _create_status_list(db: AsyncSession) -> CredentialStatusList:
     response_model=AdultVerificationResponse,
     summary="온디바이스 성인 판정 결과 기록",
     responses={
+        **AUTHENTICATED_RESPONSES,
         400: {
             "model": VcErrorResponse,
             "description": "기기가 ACTIVE 상태가 아님 (DEVICE_NOT_ACTIVE)",
@@ -267,6 +268,7 @@ async def record_adult_verification(
     response_model=IssueVcResponse,
     summary="성인 인증 VC 발급",
     responses={
+        **AUTHENTICATED_RESPONSES,
         400: {
             "model": VcErrorResponse,
             "description": (

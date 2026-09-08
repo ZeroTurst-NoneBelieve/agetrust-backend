@@ -134,5 +134,46 @@ class OpenApiContractTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+    def test_protected_endpoints_document_their_401(self):
+        """문지기가 던지는 401은 FastAPI가 자동 문서화하지 않아 손으로 얹는다.
+
+        보호된 엔드포인트를 새로 추가하면서 공용 responses를 빠뜨리면
+        여기서 걸린다. 클라이언트가 가장 자주 만나는 오류다.
+        """
+        missing = []
+
+        for path, methods in self.openapi["paths"].items():
+            for method, operation in methods.items():
+                if operation.get("security") is None:
+                    continue
+                schema = (
+                    operation.get("responses", {})
+                    .get("401", {})
+                    .get("content", {})
+                    .get("application/json", {})
+                    .get("schema", {})
+                )
+                if schema.get("$ref") != "#/components/schemas/AuthErrorResponse":
+                    missing.append(f"{method.upper()} {path}")
+
+        self.assertEqual(missing, [])
+
+    def test_admin_endpoints_document_their_403(self):
+        """require_admin이 걸린 경로는 403도 함께 문서화한다."""
+        admin_paths = [p for p in self.openapi["paths"] if p.startswith("/api/v1/admin/")]
+        self.assertTrue(admin_paths, "admin 엔드포인트가 하나도 없다")
+
+        for path in admin_paths:
+            for method, operation in self.openapi["paths"][path].items():
+                with self.subTest(path=path, method=method):
+                    schema = operation["responses"]["403"]["content"]["application/json"][
+                        "schema"
+                    ]
+                    self.assertEqual(
+                        schema["$ref"],
+                        "#/components/schemas/AuthErrorResponse",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

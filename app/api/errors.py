@@ -12,6 +12,8 @@ from enum import StrEnum
 
 from fastapi import HTTPException
 
+from app.schemas.errors import AuthErrorResponse
+
 
 def api_error(
     code: StrEnum,
@@ -32,3 +34,26 @@ def api_error(
     if message is not None:
         detail["message"] = message
     return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+# 문지기(deps.py)가 던지는 401·403은 엔드포인트 코드에 나타나지 않아 FastAPI가
+# 문서화하지 못한다. 그래서 보호된 엔드포인트마다 손으로 얹는다.
+# 딕셔너리 하나를 공유하므로 문구가 엔드포인트별로 갈라지지 않는다.
+AUTHENTICATED_RESPONSES = {
+    401: {
+        "model": AuthErrorResponse,
+        "description": (
+            "액세스 토큰이 없거나(TOKEN_MISSING) 만료(TOKEN_EXPIRED) · "
+            "위조(TOKEN_INVALID) · 종류가 다르거나(TOKEN_WRONG_TYPE) "
+            "토큰의 사용자가 없음(USER_NOT_FOUND)"
+        ),
+    },
+}
+
+ADMIN_RESPONSES = {
+    **AUTHENTICATED_RESPONSES,
+    403: {
+        "model": AuthErrorResponse,
+        "description": "platform_role이 ADMIN이 아님 (PERMISSION_DENIED)",
+    },
+}

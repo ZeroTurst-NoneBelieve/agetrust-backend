@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.api.errors import api_error
+from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
@@ -407,7 +407,12 @@ async def logout():
     return None
 
 
-@router.get("/me", response_model=UserResponse, summary="내 정보 조회")
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    summary="내 정보 조회",
+    responses=AUTHENTICATED_RESPONSES,
+)
 async def me(user: User = Depends(get_current_user)):
     """액세스 토큰으로 본인 정보를 조회한다."""
     return user
@@ -420,6 +425,7 @@ async def me(user: User = Depends(get_current_user)):
     "/devices",
     response_model=DeviceResponse,
     summary="기기 등록",
+    responses=AUTHENTICATED_RESPONSES,
 )
 async def register_device(
     body: RegisterDeviceRequest, user: User = Depends(get_current_user),
@@ -455,6 +461,7 @@ async def register_device(
     response_model=DeviceResponse,
     summary="Holder 공개키 바인딩",
     responses={
+        **AUTHENTICATED_RESPONSES,
         400: {
             "model": VcErrorResponse,
             "description": "소유 증명 서명 검증 실패 (HOLDER_KEY_PROOF_FAILED)",
@@ -546,6 +553,7 @@ async def bind_holder_key(
     "/devices",
     response_model=list[DeviceResponse],
     summary="내 기기 목록 조회",
+    responses=AUTHENTICATED_RESPONSES,
 )
 async def list_my_devices(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """본인이 등록한 기기 목록을 조회한다."""
