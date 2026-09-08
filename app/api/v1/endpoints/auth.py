@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.errors import api_error
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
@@ -54,7 +55,8 @@ logger = logging.getLogger(__name__)
 
 
 def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
-    return HTTPException(status_code=status_code, detail={"code": code.value})
+    """인증 실패가 기본이라 401을 기본값으로 둔다. 본문 형태는 공용 생성기가 정한다."""
+    return api_error(code, status_code)
 
 
 async def _record_phone_verification_failure(
