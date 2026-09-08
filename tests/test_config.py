@@ -38,7 +38,7 @@ class DefaultedFieldsTest(unittest.TestCase):
 
         self.assertIn("DEV_MODE", missing)
         self.assertIn("PUBLIC_BASE_URL", missing)
-        self.assertIn("KAFKA_PUBLISHER_ENABLED", missing)
+        self.assertIn("LOG_LEVEL", missing)
 
     def test_warning_lists_defaulted_fields_in_one_line(self):
         s = _settings_with_env({"DEV_MODE": "true"})
@@ -55,7 +55,7 @@ class DefaultedFieldsTest(unittest.TestCase):
         every = {name.upper(): "1" for name in Settings.model_fields}
         every.update(REQUIRED)
         every["DEV_MODE"] = "false"
-        every["KAFKA_PUBLISHER_ENABLED"] = "false"
+        every["LOG_LEVEL"] = "INFO"
         s = _settings_with_env(every)
 
         logger = logging.getLogger("app.config")
