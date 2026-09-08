@@ -1,4 +1,8 @@
+import logging
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -47,6 +51,21 @@ class Settings(BaseSettings):
     dev_mode: bool = False
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    def defaulted_fields(self) -> list[str]:
+        """환경변수나 .env에 없어서 코드 기본값으로 떨어진 설정의 환경변수 이름."""
+        return sorted(name.upper() for name in type(self).model_fields if name not in self.model_fields_set)
+
+
+def log_defaulted_settings(settings: "Settings") -> None:
+    """기본값으로 떨어진 설정을 기동 로그에 한 줄로 남긴다 (#37).
+
+    설정이 전달되지 않아도 앱은 조용히 기본값으로 돌아간다. 배포 서버 .env의
+    오타·누락이나 compose 배선 실수를 기동 시점에 눈에 보이게 하기 위한 것이다.
+    """
+    missing = settings.defaulted_fields()
+    if missing:
+        logger.warning("환경변수에 없어 코드 기본값을 쓰는 설정: %s", ", ".join(missing))
 
 
 settings = Settings()
