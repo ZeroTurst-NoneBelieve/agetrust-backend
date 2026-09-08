@@ -63,11 +63,14 @@ pip install -r requirements.txt -r requirements-dev.txt
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | docker compose가 PostgreSQL 컨테이너 초기화와 `DATABASE_URL` 조립에 씁니다 |
 | `DATABASE_URL` | 호스트에서 직접 실행할 때 쓰는 접속 문자열. 예: `postgresql+asyncpg://<user>:<pw>@localhost:5432/<db>` |
 | `SECRET_KEY` | JWT 서명 키. 32바이트 이상 |
-| `ISSUER_PRIVATE_KEY` | 발급자 Ed25519 개인키(base64 raw 32바이트). **팀에서 공유하는 값**을 써야 합니다 — `.env.example` 주석 참고 |
+| `ISSUER_PRIVATE_KEY` | 발급자 Ed25519 개인키(base64 raw 32바이트). **팀에서 공유하는 값**을 써야 합니다 — `.env.example` 주석 참고. 보관·회전 정책은 ADR-0015(`agetrust-docs`) |
 
 나머지(Kafka 주소, 토픽, OTP·토큰 만료 시간 등)는 `app/config.py`에 기본값이 있어 그대로 두어도 됩니다.
 
 `.env`는 커밋되지 않습니다. Public 레포이므로 실제 키를 다른 파일에 옮겨 적지 마세요.
+
+`ISSUER_PRIVATE_KEY`를 바꾸면 발급자 DID(`ISSUER_DID`)도 함께 바뀝니다. 값은 프로세스가 뜰 때
+한 번만 읽으므로 교체에는 재기동이 필요하고, 무중단 회전은 되지 않습니다. 절차는 ADR-0015를 따릅니다.
 
 ## 3. 인프라와 마이그레이션
 
