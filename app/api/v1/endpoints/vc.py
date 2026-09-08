@@ -444,9 +444,9 @@ async def get_status_list(
 ):
     """VC 폐기 목록을 서명된 StatusList2021Credential로 반환한다.
 
-    X-Kiosk-Key로 등록된 ACTIVE 키오스크만 조회할 수 있다. 목록 조회와
-    조건부 304 처리보다 먼저 인증한다. 키 발급/배포와 최종 헤더 계약의
-    팀 확인 사항은 docs/status-list-review.md에 기록한다.
+    Authorization: Bearer <api_key>로 등록된 ACTIVE 키오스크만 조회할 수 있다.
+    목록 조회와 조건부 304 처리보다 먼저 인증한다. #42 계약과 헤더를 맞췄으며,
+    키 발급/배포 후속 범위는 docs/status-list-review.md에 기록한다.
     발급된 VC의 credentialStatus.statusListCredential이 이 주소를 가리킨다.
     기존 VC의 /status/{id} 주소도 동일한 인증을 거치는 호환 별칭으로 유지한다.
 
@@ -486,7 +486,7 @@ async def get_status_list(
         # 공유 캐시는 저장하지 않고, HTTP 캐시 재사용도 서버 인증/재검증을
         # 거친다. 키오스크 앱의 별도 오프라인 저장·검증 정책과는 구분한다.
         "Cache-Control": "private, no-cache",
-        "Vary": "X-Kiosk-Key",
+        "Vary": "Authorization",
         "ETag": _status_list_etag(status_list),
     }
     if _etag_matches(if_none_match, headers["ETag"]):

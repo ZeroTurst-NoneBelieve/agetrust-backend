@@ -179,7 +179,7 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             )
             db.add(kiosk)
             await db.commit()
-            return kiosk.id, {"X-Kiosk-Key": f"{identifier}:{raw_key}"}
+            return kiosk.id, {"Authorization": f"Bearer {raw_key}"}
 
     async def _signed_up_user(self):
         """전화 인증 -> 가입 -> 로그인까지 마친 사용자를 만든다."""
@@ -393,20 +393,35 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(index, 0)
         self.assertLess(index, BITSTRING_SIZE)
 
+        # 먼저 다른 키오스크를 넣어도 키 해시가 가리키는 행을 정확히 찾아야 한다.
+        # 첫 행을 임의로 고르면 아래 정상 조회가 INACTIVE로 거절된다.
+        other_kiosk_id, other_kiosk_headers = await self._registered_kiosk()
         kiosk_id, kiosk_headers = await self._registered_kiosk()
+        async with self.session_factory() as db:
+            other_kiosk = await db.get(Kiosk, other_kiosk_id)
+            other_kiosk.status = "INACTIVE"
+            other_key_hash = other_kiosk.api_key_hash
+            kiosk = await db.get(Kiosk, kiosk_id)
+            kiosk_identifier = kiosk.kiosk_identifier
+            kiosk_key_hash = kiosk.api_key_hash
+            await db.commit()
+        raw_kiosk_key = kiosk_headers["Authorization"].removeprefix("Bearer ")
         status_list_id = status_path.rsplit("/", 1)[-1]
         legacy_status_path = f"/api/v1/status/{status_list_id}"
 
         # 새 주소와 기존 VC의 주소 모두 키오스크 키 없이는 조회할 수 없다.
         # 일반 사용자 로그인 토큰도 키오스크 인증을 대신하지 않는다.
         invalid_headers = (
-            {},
-            {"X-Kiosk-Key": kiosk_headers["X-Kiosk-Key"] + "-wrong"},
-            auth,
+            ("missing", {}),
+            ("unknown", {"Authorization": f"Bearer {secrets.token_urlsafe(32)}"}),
+            ("wrong", {"Authorization": kiosk_headers["Authorization"] + "-wrong"}),
+            ("wrong-scheme", {"Authorization": f"Basic {raw_kiosk_key}"}),
+            ("legacy-header", {"X-Kiosk-Key": f"{kiosk_identifier}:{raw_kiosk_key}"}),
+            ("user-token", auth),
         )
         for path in (status_path, legacy_status_path):
-            for headers in invalid_headers:
-                with self.subTest(path=path, headers_present=tuple(headers)):
+            for label, headers in invalid_headers:
+                with self.subTest(path=path, credentials=label):
                     r = await self.client.get(path, headers=headers)
                     self.assertEqual(r.status_code, 401, r.text)
                     self.assertEqual(r.json()["detail"]["code"], "KIOSK_KEY_INVALID")
@@ -418,7 +433,7 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.headers["content-type"], "application/jwt")
         self.assertEqual(r.headers["cache-control"], "private, no-cache")
-        self.assertIn("x-kiosk-key", r.headers["vary"].lower())
+        self.assertIn("authorization", r.headers["vary"].lower())
         initial_etag = r.headers["etag"]
         initial_list = jwt.decode(r.text, issuer_key, algorithms=["EdDSA"], issuer=issued["issuer_did"])
         self.assertEqual(initial_list["vc"]["id"], status_url)
@@ -432,9 +447,41 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.content, b"")
         self.assertEqual(r.headers["etag"], initial_etag)
         self.assertEqual(r.headers["cache-control"], "private, no-cache")
-        self.assertIn("x-kiosk-key", r.headers["vary"].lower())
+        self.assertIn("authorization", r.headers["vary"].lower())
+
+        # 같은 키 해시가 두 행에 있으면 임의의 키오스크로 인증하지 않는다.
+        # DB의 UNIQUE 여부에 기대지 않고, 실제 PostgreSQL의 중복 행으로 확인한다.
+        try:
+            async with self.session_factory() as db:
+                other_kiosk = await db.get(Kiosk, other_kiosk_id)
+                other_kiosk.api_key_hash = kiosk_key_hash
+                other_kiosk.status = "ACTIVE"
+                await db.commit()
+            for path in (status_path, legacy_status_path):
+                for etag in (None, initial_etag):
+                    headers = dict(kiosk_headers)
+                    if etag is not None:
+                        headers["If-None-Match"] = etag
+                    with self.subTest(path=path, duplicate_key=True, conditional=etag is not None):
+                        r = await self.client.get(path, headers=headers)
+                        self.assertEqual(r.status_code, 401, r.text)
+                        self.assertEqual(r.json()["detail"]["code"], "KIOSK_KEY_INVALID")
+                        self.assertEqual(r.headers["cache-control"], "no-store")
+        finally:
+            async with self.session_factory() as db:
+                other_kiosk = await db.get(Kiosk, other_kiosk_id)
+                other_kiosk.api_key_hash = other_key_hash
+                await db.commit()
+
+        # 중복을 해소하면 두 키 모두 자신의 키오스크를 찾아 정상 인증된다.
+        for headers in (kiosk_headers, other_kiosk_headers):
+            r = await self.client.get(
+                status_path, headers={**headers, "If-None-Match": initial_etag}
+            )
+            self.assertEqual(r.status_code, 304, r.text)
 
         # 이미 받은 ETag가 있어도 현재 비활성/폐기된 키오스크는 304를 못 받는다.
+        # 다른 ACTIVE 키오스크가 있어도 그 행으로 대신 인증하면 안 된다.
         # 이 테스트에서 새로 만든 키오스크 행만 변경한다.
         try:
             for kiosk_status in ("INACTIVE", "REVOKED"):

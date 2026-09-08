@@ -5,11 +5,12 @@ import hashlib
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import jwt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sqlalchemy.exc import MultipleResultsFound
 
 _ISSUER_KEY_BYTES = bytes(range(32))
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
@@ -49,7 +50,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
 
     def _key_headers(self, raw_key=None):
         key = self.RAW_KEY if raw_key is None else raw_key
-        return {"X-Kiosk-Key": f"{self.IDENTIFIER}:{key}"}
+        return {"Authorization": f"Bearer {key}"}
 
     async def _get(self, path, headers=None):
         async def override_db():
@@ -76,6 +77,8 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"detail": {"code": code}})
         self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["vary"], "Authorization")
+        self.assertEqual(response.headers["www-authenticate"], "Bearer")
         self.assertNotIn("etag", response.headers)
         self.assertNotIn(self.RAW_KEY, response.text)
         # Neither an existence check nor signing may run before authentication.
@@ -92,16 +95,19 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.headers["content-type"], "application/jwt")
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+                self.assertEqual(response.headers["vary"], "Authorization")
                 payload = jwt.decode(response.text, public_key, algorithms=["EdDSA"])
                 self.assertEqual(payload["vc"]["id"], self.row.status_list_url)
 
     async def test_missing_and_malformed_headers_are_denied_on_both_routes(self):
-        header_values = (None, "", "without-separator", ":", f":{self.RAW_KEY}", f"{self.IDENTIFIER}:")
+        header_values = (
+            None, "", "without-separator", "Bearer", "Bearer ", "Bearer  ",
+            f"Basic {self.RAW_KEY}", f"Digest {self.RAW_KEY}", f"Token {self.RAW_KEY}",
+        )
         for path in self.PATHS:
             for header in header_values:
                 with self.subTest(path=path, header=header):
-                    headers = {} if header is None else {"X-Kiosk-Key": header}
+                    headers = {} if header is None else {"Authorization": header}
                     await self._assert_denied(path, headers)
 
     async def test_empty_raw_key_is_denied_even_if_empty_hash_is_stored(self):
@@ -114,7 +120,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.db.scalar_results[Kiosk] = None
         for path in self.PATHS:
             with self.subTest(path=path):
-                await self._assert_denied(path, {"X-Kiosk-Key": f"unknown-kiosk:{self.RAW_KEY}"})
+                await self._assert_denied(path, self._key_headers("unknown-kiosk-key"))
 
     async def test_wrong_raw_key_is_denied_without_disclosing_list(self):
         for stored_hash in (self.kiosk.api_key_hash, "not-a-hash", "잘못된-해시"):
@@ -168,7 +174,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 304)
                 self.assertEqual(response.content, b"")
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+                self.assertEqual(response.headers["vary"], "Authorization")
 
     async def test_revocation_after_fetch_rejects_conditional_revalidation(self):
         initial = await self._get(self.PATHS[0], self._key_headers())
@@ -181,6 +187,53 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                     {**self._key_headers(), "If-None-Match": initial.headers["etag"]},
                     code="KIOSK_INACTIVE",
                 )
+
+    async def test_legacy_header_is_not_an_authentication_fallback(self):
+        legacy = {"X-Kiosk-Key": f"{self.IDENTIFIER}:{self.RAW_KEY}"}
+        for path in self.PATHS:
+            for headers in (legacy, {**legacy, **self._key_headers("wrong-key")},
+                            {**legacy, "Authorization": f"Basic {self.RAW_KEY}"}):
+                with self.subTest(path=path, header_names=tuple(headers)):
+                    await self._assert_denied(path, headers)
+
+    async def test_valid_bearer_does_not_take_identity_from_legacy_header(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                response = await self._get(
+                    path,
+                    {**self._key_headers(), "X-Kiosk-Key": "another-kiosk:unrelated-key"},
+                )
+                self.assertEqual(response.status_code, 200)
+
+    async def test_bearer_contains_only_raw_key_not_identifier_prefix(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                await self._assert_denied(path, self._key_headers(f"{self.IDENTIFIER}:{self.RAW_KEY}"))
+
+    async def test_kiosk_query_uses_key_hash_not_identifier_and_detects_duplicates(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                with patch.object(self.db, "execute", wraps=self.db.execute) as execute:
+                    response = await self._get(path, self._key_headers())
+                self.assertEqual(response.status_code, 200)
+                execute.assert_awaited_once()
+                query = execute.await_args.args[0]
+                sql = str(query.compile(compile_kwargs={"literal_binds": True}))
+                where_clause = sql.split("WHERE", 1)[1]
+                digest = hashlib.sha256(self.RAW_KEY.encode()).hexdigest()
+                self.assertIn(f"kiosks.api_key_hash = '{digest}'", where_clause)
+                self.assertNotIn("kiosks.kiosk_identifier", where_clause)
+                self.assertNotIn(self.RAW_KEY, sql)
+                self.assertIn("LIMIT 2", where_clause)
+
+    async def test_duplicate_key_hash_is_rejected_instead_of_selecting_one_kiosk(self):
+        duplicate_result = SimpleNamespace(
+            scalar_one_or_none=Mock(side_effect=MultipleResultsFound("duplicate test key"))
+        )
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                with patch.object(self.db, "execute", new=AsyncMock(return_value=duplicate_result)):
+                    await self._assert_denied(path, self._key_headers())
 
 
 if __name__ == "__main__":

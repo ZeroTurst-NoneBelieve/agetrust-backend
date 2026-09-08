@@ -176,9 +176,9 @@ class VcRouteTests(unittest.TestCase):
 
         self.assertEqual(operation["security"], [{"KioskApiKey": []}])
         scheme = app.openapi()["components"]["securitySchemes"]["KioskApiKey"]
-        self.assertEqual(scheme["type"], "apiKey")
-        self.assertEqual(scheme["in"], "header")
-        self.assertEqual(scheme["name"], "X-Kiosk-Key")
+        self.assertEqual(scheme["type"], "http")
+        self.assertEqual(scheme["scheme"], "bearer")
+        self.assertEqual(scheme["bearerFormat"], "API key")
         self.assertEqual(
             operation["responses"]["401"]["content"]["application/json"]["schema"],
             {"$ref": "#/components/schemas/AuthErrorResponse"},
@@ -544,7 +544,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             status="ACTIVE",
         )
         request_headers = httpx.Headers(headers)
-        request_headers["X-Kiosk-Key"] = f"test-status-list-reader:{raw_key}"
+        request_headers["Authorization"] = f"Bearer {raw_key}"
 
         async def override_db():
             yield db
@@ -693,7 +693,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.headers["content-type"], "application/jwt")
             self.assertEqual(response.headers["cache-control"], "private, no-cache")
-            self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+            self.assertEqual(response.headers["vary"], "Authorization")
             payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
             self.assertEqual(payload["vc"]["id"], self.URL)
         self.assertEqual(canonical.headers["etag"], legacy.headers["etag"])
@@ -724,7 +724,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
                     response.headers["cache-control"], initial.headers["cache-control"]
                 )
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "X-Kiosk-Key")
+                self.assertEqual(response.headers["vary"], "Authorization")
                 signer.assert_not_called()
 
     async def test_nonmatching_etags_return_signed_body(self):

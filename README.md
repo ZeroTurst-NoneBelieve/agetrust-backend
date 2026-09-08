@@ -127,9 +127,10 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 E2E는 테이블에 실제로 쓰기를 하므로 운영 DB를 가리키지 마세요.
 
-상태 목록은 `X-Kiosk-Key: <kiosk_identifier>:<raw_key>`로 등록된 ACTIVE 키오스크만
+상태 목록은 `Authorization: Bearer <api_key>`로 등록된 ACTIVE 키오스크만
 조회할 수 있습니다. 기존 `/api/v1/status/{id}` 경로에도 같은 인증이 필요합니다.
-URL 호환성, 캐시 동작, 인증 헤더·키 배포 관련 팀 확인 사항은
+API Key 원문만 보내며 사용자 로그인 JWT나 `식별자:키` 형식이 아닙니다.
+이전 `X-Kiosk-Key` 방식은 지원하지 않습니다. URL 호환성, 캐시 동작, 키 배포 후속 범위는
 [#27 리뷰 반영 범위](docs/status-list-review.md)를 참고하세요.
 키오스크 K-6 담당자와 연동할 때는
 [폐기 목록 연동 안내](docs/status-list-kiosk-handoff.md)를 참고하세요.
