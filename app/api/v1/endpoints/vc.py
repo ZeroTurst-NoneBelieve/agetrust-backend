@@ -6,11 +6,12 @@ import re
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, Response, status
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_kiosk, get_current_user
+from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import record_audit_event
 from app.core.status_list import (
@@ -38,7 +39,12 @@ from app.models import (
     VcCredential,
 )
 from app.schemas.audit import AuditActorType, AuditAggregateType, AuditEventType
-from app.schemas.errors import AdultVerificationStatus, AuthErrorResponse
+from app.schemas.errors import (
+    AdultVerificationStatus,
+    AuthErrorResponse,
+    VcError,
+    VcErrorResponse,
+)
 from app.schemas.vc import (
     AdultVerificationRequest,
     AdultVerificationResponse,
@@ -80,7 +86,7 @@ async def _pick_unused_index(db: AsyncSession, status_list_id: int) -> int:
     taken = set(result.scalars().all())
     available = [index for index in range(BITSTRING_SIZE) if index not in taken]
     if not available:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="status list is full")
+        raise api_error(VcError.STATUS_LIST_FULL, status.HTTP_503_SERVICE_UNAVAILABLE)
     return secrets.choice(available)
 
 
@@ -124,10 +130,7 @@ async def _allocate_status_list_entry(
         # 목록 하나가 13만 건을 담으므로 현실적으로 도달하지 않는다. 다만
         # 조용히 넘어가면 범위를 벗어난 인덱스가 배정되므로 명시적으로 막는다.
         # 목록을 여러 개로 넘기는 처리는 별도 이슈로 다룬다.
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="status list is full",
-        )
+        raise api_error(VcError.STATUS_LIST_FULL, status.HTTP_503_SERVICE_UNAVAILABLE)
 
     # 잠금은 동시 배정만 막는다. 이미 쓰인 후보는 직접 확인하고 다시 뽑는다.
     for _ in range(_INDEX_PICK_ATTEMPTS):
@@ -170,8 +173,15 @@ async def _create_status_list(db: AsyncSession) -> CredentialStatusList:
     response_model=AdultVerificationResponse,
     summary="온디바이스 성인 판정 결과 기록",
     responses={
-        400: {"description": "기기가 ACTIVE 상태가 아님"},
-        404: {"description": "기기를 찾을 수 없거나 본인 소유가 아님"},
+        **AUTHENTICATED_RESPONSES,
+        400: {
+            "model": VcErrorResponse,
+            "description": "기기가 ACTIVE 상태가 아님 (DEVICE_NOT_ACTIVE)",
+        },
+        404: {
+            "model": VcErrorResponse,
+            "description": "기기를 찾을 수 없거나 본인 소유가 아님 (DEVICE_NOT_FOUND)",
+        },
     },
 )
 async def record_adult_verification(
@@ -191,12 +201,9 @@ async def record_adult_verification(
     """
     device = await db.get(Device, body.device_id)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if device.status != "ACTIVE":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device is not active",
-        )
+        raise api_error(VcError.DEVICE_NOT_ACTIVE, status.HTTP_400_BAD_REQUEST)
 
     if not body.age_check_passed:
         result_status, failure_code = (
@@ -261,13 +268,30 @@ async def record_adult_verification(
     response_model=IssueVcResponse,
     summary="성인 인증 VC 발급",
     responses={
+        **AUTHENTICATED_RESPONSES,
         400: {
+            "model": VcErrorResponse,
             "description": (
-                "판정이 SUCCESS가 아니거나 무효화됨 / "
-                "기기가 ACTIVE가 아님 / holder_did 미등록"
-            )
+                "판정이 SUCCESS가 아니거나(VERIFICATION_NOT_SUCCESSFUL) "
+                "무효화됨(VERIFICATION_INVALIDATED) / "
+                "기기가 ACTIVE가 아님(DEVICE_NOT_ACTIVE) / "
+                "holder_did 미등록(HOLDER_DID_NOT_BOUND)"
+            ),
         },
-        404: {"description": "판정 기록 또는 기기를 찾을 수 없거나 본인 소유가 아님"},
+        404: {
+            "model": VcErrorResponse,
+            "description": (
+                "판정 기록(VERIFICATION_NOT_FOUND) 또는 "
+                "기기(DEVICE_NOT_FOUND)를 찾을 수 없거나 본인 소유가 아님"
+            ),
+        },
+        503: {
+            "model": VcErrorResponse,
+            "description": (
+                "폐기 목록 13만 자리가 모두 차 인덱스를 배정할 수 없음 "
+                "(STATUS_LIST_FULL)"
+            ),
+        },
     },
 )
 async def issue_credential(
@@ -292,20 +316,11 @@ async def issue_credential(
     """
     verification = await db.get(AdultVerification, body.adult_verification_id)
     if verification is None or verification.user_id != user.id:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            detail="verification not found",
-        )
+        raise api_error(VcError.VERIFICATION_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if verification.result_status != AdultVerificationStatus.SUCCESS.value:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="adult verification was not successful",
-        )
+        raise api_error(VcError.VERIFICATION_NOT_SUCCESSFUL, status.HTTP_400_BAD_REQUEST)
     if verification.invalidated_at is not None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="adult verification was invalidated",
-        )
+        raise api_error(VcError.VERIFICATION_INVALIDATED, status.HTTP_400_BAD_REQUEST)
 
     # 재바인딩(POST /auth/devices/bind-holder-key)과 같은 기기 행을 잠가 두
     # 요청을 직렬화한다. 잠금이 없으면 여기서 읽은 holder_did가 아래에서 VC를
@@ -314,17 +329,11 @@ async def issue_credential(
     # 기기가 키오스크를 그대로 통과한다.
     device = await db.get(Device, verification.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if device.status != "ACTIVE":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device is not active",
-        )
+        raise api_error(VcError.DEVICE_NOT_ACTIVE, status.HTTP_400_BAD_REQUEST)
     if not device.holder_did:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail="device has no holder_did. Register device and bind holder key first.",
-        )
+        raise api_error(VcError.HOLDER_DID_NOT_BOUND, status.HTTP_400_BAD_REQUEST)
 
     # 상태 목록의 자리를 먼저 잡아야 VC 본문에 credentialStatus를 실을 수 있다.
     # did:key VC는 자기완결적이라 키오스크가 서버에 묻지 않고 검증하는데,
@@ -432,8 +441,17 @@ def _etag_matches(if_none_match: list[str] | None, etag: str) -> bool:
             "description": "키오스크 키가 없거나 잘못됨 또는 키오스크가 비활성/폐기 상태임",
             "model": AuthErrorResponse,
         },
-        404: {"description": "해당 상태 목록이 없음"},
-        503: {"description": "상태 목록이 비어 있거나 손상되어 응답할 수 없음"},
+        404: {
+            "model": VcErrorResponse,
+            "description": "해당 상태 목록이 없음 (STATUS_LIST_NOT_FOUND)",
+        },
+        503: {
+            "model": VcErrorResponse,
+            "description": (
+                "상태 목록이 비어 있거나 손상되어 응답할 수 없음 "
+                "(STATUS_LIST_UNAVAILABLE)"
+            ),
+        },
     },
 )
 async def get_status_list(
@@ -461,9 +479,9 @@ async def get_status_list(
     """
     status_list = await db.get(CredentialStatusList, status_list_id)
     if status_list is None:
-        raise HTTPException(
+        raise api_error(
+            VcError.STATUS_LIST_NOT_FOUND,
             status.HTTP_404_NOT_FOUND,
-            detail="status list not found",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -476,9 +494,9 @@ async def get_status_list(
             raise ValueError("empty status list")
         decode_bitstring(status_list.encoded_list)
     except ValueError as error:
-        raise HTTPException(
+        raise api_error(
+            VcError.STATUS_LIST_UNAVAILABLE,
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="status list is not available",
             headers={"Cache-Control": "no-store"},
         ) from error
 
@@ -530,7 +548,15 @@ async def get_issuer_did_document():
 @router.get(
     "/did/{did}",
     summary="did:key DID Document 해석",
-    responses={400: {"description": "did:key 형식이 아니거나 파싱할 수 없는 DID"}},
+    responses={
+        400: {
+            "model": VcErrorResponse,
+            "description": (
+                "did:key 형식이 아니거나 파싱할 수 없는 DID (INVALID_DID_FORMAT). "
+                "실패 사유는 detail.message에 담긴다."
+            ),
+        },
+    },
 )
 async def resolve_did_document(did: str):
     """did:key DID를 공개키가 포함된 DID Document로 해석한다.
@@ -543,7 +569,10 @@ async def resolve_did_document(did: str):
     try:
         return build_did_document(did)
     except ValueError as error:
-        raise HTTPException(
+        # 파싱 실패 사유는 코드 하나로 뭉뚱그릴 수 없어 message로 함께 내려보낸다.
+        # 분기는 code로 하고, message는 어디가 틀렸는지 사람이 읽는 용도다.
+        raise api_error(
+            VcError.INVALID_DID_FORMAT,
             status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
+            message=str(error),
         ) from error

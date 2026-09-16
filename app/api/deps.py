@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import api_error
 from app.core.security import TokenError, decode_login_token
 from app.database import get_db
 from app.models import Kiosk, User
@@ -27,7 +28,8 @@ kiosk_key_scheme = HTTPBearer(
 
 
 def _deny(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
-    return HTTPException(status_code=status_code, detail={"code": code.value})
+    """문지기가 막는 경우는 대부분 401이라 기본값으로 둔다."""
+    return api_error(code, status_code)
 
 
 async def get_current_user(
