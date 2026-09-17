@@ -19,28 +19,19 @@ services:
   backend:
     build: .
     container_name: agetrust-backend
+    # .env의 값을 전부 컨테이너 환경변수로 넘긴다 (#37). 설정을 추가할 때
+    # 여기에 이름을 다시 적을 필요가 없다. 이전에는 아래 environment에 하나씩
+    # 나열했고, 빠뜨리면 .env에 적어도 조용히 무시되는 사고가 두 번 났다(#24 · #32).
+    # 이미지에는 들어가지 않는다. compose가 기동 시점에 주입할 뿐이다.
+    env_file: .env
+    # environment는 env_file보다 우선한다. 두 경우에만 쓴다.
     environment:
+      # 1) 컨테이너 안에서 값이 달라야 하는 것. .env의 DATABASE_URL은 호스트에서
+      #    직접 실행할 때 쓰는 localhost 주소이므로 postgres 서비스명으로 덮어쓴다.
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
+      # 2) 비어 있으면 기동을 막아야 하는 시크릿. env_file은 빈 값을 검사하지 않는다.
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Set it in .env}
       ISSUER_PRIVATE_KEY: ${ISSUER_PRIVATE_KEY:?ISSUER_PRIVATE_KEY is required. Set it in .env}
-      # .env는 컨테이너 안으로 들어가지 않는다. docker compose가 ${} 치환에만
-      # 쓰기 때문이다. 그래서 앱이 읽어야 하는 값은 여기에 전부 나열해야 한다.
-      # 하나라도 빠지면 .env에 적어도 조용히 무시되고 코드 기본값이 쓰인다.
-      # 전부 시크릿이 아니라 환경마다 달라지는 값이라 기본값을 둔다.
-      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:29092}
-      KAFKA_AUDIT_TOPIC: ${KAFKA_AUDIT_TOPIC:-agetrust.audit-events}
-      KAFKA_PUBLISHER_ENABLED: ${KAFKA_PUBLISHER_ENABLED:-true}
-      OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS:-2.0}
-      OUTBOX_PUBLISH_BATCH_SIZE: ${OUTBOX_PUBLISH_BATCH_SIZE:-100}
-      OUTBOX_MAX_RETRY_COUNT: ${OUTBOX_MAX_RETRY_COUNT:-10}
-      # 기본값 false를 유지한다(#24). 여기 없으면 .env에 DEV_MODE=true를 적어도
-      # 조용히 무시되어, 문서대로 했는데 안 켜지는 상태가 된다.
-      DEV_MODE: ${DEV_MODE:-false}
-      # 발급되는 VC의 credentialStatus에 박히는 공개 주소(#27). 키오스크가 이
-      # 주소로 폐기 목록을 받아가므로, 키오스크에서 실제로 접근 가능한 값이어야
-      # 한다. localhost로 발급하면 키오스크가 자기 자신을 찾는다.
-      # 한 번 발급된 VC 안의 주소는 나중에 고칠 수 없다.
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
     ports:
       - "8000:8000"
     depends_on:

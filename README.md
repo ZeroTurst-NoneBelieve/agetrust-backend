@@ -67,6 +67,8 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 나머지(Kafka 주소, 토픽, OTP·토큰 만료 시간 등)는 `app/config.py`에 기본값이 있어 그대로 두어도 됩니다.
 
+`.env`에 적은 값은 docker compose가 `env_file`로 컨테이너에 전부 넘깁니다. 설정을 추가할 때 `docker-compose.yml`을 같이 고칠 필요가 없습니다. 예외는 `DATABASE_URL`로, 컨테이너 안에서는 compose가 `POSTGRES_*`로 다시 조립합니다. 앱은 기동 시 기본값으로 떨어진 설정을 WARNING 로그로 남기므로, 값을 적었는데 반영이 안 되면 그 로그부터 보세요.
+
 `.env`는 커밋되지 않습니다. Public 레포이므로 실제 키를 다른 파일에 옮겨 적지 마세요.
 
 `ISSUER_PRIVATE_KEY`를 바꾸면 발급자 DID(`ISSUER_DID`)도 함께 바뀝니다. 값은 프로세스가 뜰 때
