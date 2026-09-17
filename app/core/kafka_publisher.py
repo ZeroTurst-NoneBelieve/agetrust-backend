@@ -48,7 +48,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -149,6 +149,16 @@ async def _backfill_kafka_position(db: AsyncSession, event_id, metadata) -> None
             metadata.topic,
             metadata.partition,
             metadata.offset,
+            event_id,
+        )
+    except (OperationalError, InterfaceError) as error:
+        # 커넥션 리셋·statement timeout·데드락 등 (#39). 유니크 충돌과 마찬가지로
+        # 좌표 하나 못 적었다고 배치 전체를 되돌리면 이미 Kafka로 나간 이벤트가
+        # 중복 발행된다. SAVEPOINT가 이 UPDATE만 되돌리므로 계속 진행한다.
+        # 커넥션 자체가 죽은 경우라면 뒤따르는 commit이 실패하고 루프가 재연결한다.
+        logger.warning(
+            "Kafka 좌표 기록 실패 — DB 오류: %r. 발행은 성공했으므로 계속 진행한다. (event_id=%s)",
+            error,
             event_id,
         )
 

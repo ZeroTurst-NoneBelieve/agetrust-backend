@@ -92,6 +92,21 @@ uvicorn app.main:app --reload
 - Swagger UI: http://localhost:8000/docs
 - 전체 스택을 컨테이너로 띄우려면 `docker compose up`
 
+### Outbox → Kafka Publisher
+
+감사 이벤트를 Kafka로 내보내는 Publisher는 API와 **별도 프로세스**로 돕니다. compose에서는
+`publisher` 서비스이고, 호스트에서 직접 띄우려면:
+
+```bash
+python -m app.workers.publisher
+```
+
+API 안의 백그라운드 태스크가 아니라 별도 프로세스인 이유는 죽었을 때 보이게 하기 위해서입니다.
+루프가 예외로 끝나면 프로세스가 종료되고 컨테이너가 `Restarting`으로 표시되며, `docker logs agetrust-publisher`에
+traceback이 남습니다. Kafka 없이 API만 쓰려면 이 프로세스를 띄우지 않으면 됩니다.
+
+로그 레벨은 `LOG_LEVEL`(기본 `INFO`)로 조절하며 API와 Publisher에 같이 적용됩니다.
+
 ## 5. 린트
 
 규칙은 `pyproject.toml`의 `[tool.ruff]`에 있고, CI가 도는 명령과 같습니다.

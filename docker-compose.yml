@@ -1,3 +1,31 @@
+# backend(API)와 publisher(Outbox → Kafka 워커)는 같은 이미지·같은 설정으로
+# 실행 명령만 다르다. 공통 부분을 앵커로 묶어 한 곳에서만 고친다 (#39).
+x-app: &app
+  build: .
+  # .env의 값을 전부 컨테이너 환경변수로 넘긴다 (#37). 설정을 추가할 때
+  # 여기에 이름을 다시 적을 필요가 없다. 이전에는 아래 environment에 하나씩
+  # 나열했고, 빠뜨리면 .env에 적어도 조용히 무시되는 사고가 두 번 났다(#24 · #32).
+  # 이미지에는 들어가지 않는다. compose가 기동 시점에 주입할 뿐이다.
+  env_file: .env
+  # environment는 env_file보다 우선한다. 두 경우에만 쓴다.
+  environment:
+    # 1) 컨테이너 안에서 값이 달라야 하는 것. .env의 DATABASE_URL은 호스트에서
+    #    직접 실행할 때 쓰는 localhost 주소이므로 postgres 서비스명으로 덮어쓴다.
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
+    # 2) 비어 있으면 기동을 막아야 하는 시크릿. env_file은 빈 값을 검사하지 않는다.
+    SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Set it in .env}
+    ISSUER_PRIVATE_KEY: ${ISSUER_PRIVATE_KEY:?ISSUER_PRIVATE_KEY is required. Set it in .env}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    # Kafka는 healthy까지 기다리지 않는다. Publisher가 브로커 없음을 견디고
+    # 재시도하도록 만들었으므로, Kafka가 늦게 떠도 API는 즉시 뜨는 편이 낫다.
+    kafka:
+      condition: service_started
+  volumes:
+    - ./app:/app/app
+    - ./alembic:/app/alembic
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -17,33 +45,23 @@ services:
       retries: 10
 
   backend:
-    build: .
+    <<: *app
     container_name: agetrust-backend
-    # .env의 값을 전부 컨테이너 환경변수로 넘긴다 (#37). 설정을 추가할 때
-    # 여기에 이름을 다시 적을 필요가 없다. 이전에는 아래 environment에 하나씩
-    # 나열했고, 빠뜨리면 .env에 적어도 조용히 무시되는 사고가 두 번 났다(#24 · #32).
-    # 이미지에는 들어가지 않는다. compose가 기동 시점에 주입할 뿐이다.
-    env_file: .env
-    # environment는 env_file보다 우선한다. 두 경우에만 쓴다.
-    environment:
-      # 1) 컨테이너 안에서 값이 달라야 하는 것. .env의 DATABASE_URL은 호스트에서
-      #    직접 실행할 때 쓰는 localhost 주소이므로 postgres 서비스명으로 덮어쓴다.
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
-      # 2) 비어 있으면 기동을 막아야 하는 시크릿. env_file은 빈 값을 검사하지 않는다.
-      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required. Set it in .env}
-      ISSUER_PRIVATE_KEY: ${ISSUER_PRIVATE_KEY:?ISSUER_PRIVATE_KEY is required. Set it in .env}
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      # Kafka는 healthy까지 기다리지 않는다. Publisher가 브로커 없음을 견디고
-      # 재시도하도록 만들었으므로, Kafka가 늦게 떠도 API는 즉시 뜨는 편이 낫다.
-      kafka:
-        condition: service_started
-    volumes:
-      - ./app:/app/app
-      - ./alembic:/app/alembic
+
+  # Outbox → Kafka Publisher (#39). API와 같은 이미지에서 명령만 다르게 띄운다.
+  # 루프가 예외로 죽으면 프로세스가 끝나 컨테이너가 종료되고, 아래 restart
+  # 정책이 다시 띄운다. `docker ps`의 Restarting 상태와 `docker logs`의
+  # traceback으로 죽음이 드러난다. API 안의 태스크였을 때는 이게 보이지 않았다.
+  publisher:
+    <<: *app
+    container_name: agetrust-publisher
+    command: ["python", "-m", "app.workers.publisher"]
+    restart: unless-stopped
+    # SIGTERM 뒤 SIGKILL까지의 유예. aiokafka의 전송 타임아웃(기본 40초) 안에
+    # 진행 중인 배치가 커밋을 마칠 수 있어야 재기동 시 중복 발행이 줄어든다.
+    stop_grace_period: 45s
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0

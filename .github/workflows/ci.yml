@@ -61,8 +61,6 @@ jobs:
       # ISSUER_PRIVATE_KEY는 base64(0..31 바이트)로, 테스트가 쓰는 값과 같다.
       SECRET_KEY: test-secret-key-at-least-32-bytes
       ISSUER_PRIVATE_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
-      # 브로커를 띄우지 않으므로 Outbox Publisher는 끈다.
-      KAFKA_PUBLISHER_ENABLED: "false"
 
     steps:
       - uses: actions/checkout@v7
