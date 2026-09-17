@@ -50,6 +50,7 @@ from app.models import (  # noqa: E402
     Kiosk,
     VcCredential,
 )
+from app.schemas.errors import VcError  # noqa: E402
 from app.schemas.vc import AdultVerificationRequest, IssueVcRequest  # noqa: E402
 from tests.fakes import FakeDb as _FakeDb  # noqa: E402
 
@@ -194,7 +195,9 @@ class VcRouteTests(unittest.TestCase):
         response = self._get("/api/v1/did/did:web:example.com")
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("only did:key", response.json()["detail"])
+        detail = response.json()["detail"]
+        self.assertEqual(detail["code"], "INVALID_DID_FORMAT")
+        self.assertIn("only did:key", detail["message"])
 
 
 class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
@@ -239,7 +242,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             await record_adult_verification(body, self.user, db)
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(raised.exception.detail, {"code": "DEVICE_NOT_ACTIVE"})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_rejects_invalidated_verification(self):
@@ -258,7 +261,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(
             raised.exception.detail,
-            "adult verification was invalidated",
+            {"code": "VERIFICATION_INVALIDATED"},
         )
         self.assertEqual(db.commits, 0)
 
@@ -287,7 +290,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             await issue_credential(IssueVcRequest(adult_verification_id=3), self.user, db)
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.detail, "device is not active")
+        self.assertEqual(raised.exception.detail, {"code": "DEVICE_NOT_ACTIVE"})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_persists_signed_expiration(self):
@@ -456,7 +459,7 @@ class VcEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.detail, "status list is full")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_FULL.value})
         self.assertEqual(db.commits, 0)
 
     async def test_issue_credential_retries_an_already_assigned_index(self):
@@ -663,7 +666,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             await get_status_list(7, db)
 
         self.assertEqual(raised.exception.status_code, 503)
-        self.assertEqual(raised.exception.detail, "status list is not available")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_UNAVAILABLE.value})
 
     async def test_invalid_nonempty_lists_are_rejected_before_signing(self):
         short_gzip = base64.urlsafe_b64encode(gzip.compress(b"\x00")).decode().rstrip("=")
@@ -794,7 +797,7 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             await get_status_list(999, db)
 
         self.assertEqual(raised.exception.status_code, 404)
-        self.assertEqual(raised.exception.detail, "status list not found")
+        self.assertEqual(raised.exception.detail, {"code": VcError.STATUS_LIST_NOT_FOUND.value})
 
 
 if __name__ == "__main__":

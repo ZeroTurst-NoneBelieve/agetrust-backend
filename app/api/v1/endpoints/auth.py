@@ -9,11 +9,12 @@ import base64
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
@@ -37,7 +38,7 @@ from app.schemas.audit import (
     AuditEventType,
 )
 from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDeviceRequest
-from app.schemas.errors import AuthError, AuthErrorResponse
+from app.schemas.errors import AuthError, AuthErrorResponse, VcError, VcErrorResponse
 from app.schemas.user import (
     LoginRequest,
     PhoneRequestBody,
@@ -54,7 +55,8 @@ logger = logging.getLogger(__name__)
 
 
 def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
-    return HTTPException(status_code=status_code, detail={"code": code.value})
+    """인증 실패가 기본이라 401을 기본값으로 둔다. 본문 형태는 공용 생성기가 정한다."""
+    return api_error(code, status_code)
 
 
 async def _record_phone_verification_failure(
@@ -405,7 +407,12 @@ async def logout():
     return None
 
 
-@router.get("/me", response_model=UserResponse, summary="내 정보 조회")
+@router.get(
+    "/me",
+    response_model=UserResponse,
+    summary="내 정보 조회",
+    responses=AUTHENTICATED_RESPONSES,
+)
 async def me(user: User = Depends(get_current_user)):
     """액세스 토큰으로 본인 정보를 조회한다."""
     return user
@@ -418,6 +425,7 @@ async def me(user: User = Depends(get_current_user)):
     "/devices",
     response_model=DeviceResponse,
     summary="기기 등록",
+    responses=AUTHENTICATED_RESPONSES,
 )
 async def register_device(
     body: RegisterDeviceRequest, user: User = Depends(get_current_user),
@@ -453,8 +461,15 @@ async def register_device(
     response_model=DeviceResponse,
     summary="Holder 공개키 바인딩",
     responses={
-        400: {"description": "소유 증명 서명 검증 실패"},
-        404: {"description": "기기를 찾을 수 없거나 본인 소유가 아님"},
+        **AUTHENTICATED_RESPONSES,
+        400: {
+            "model": VcErrorResponse,
+            "description": "소유 증명 서명 검증 실패 (HOLDER_KEY_PROOF_FAILED)",
+        },
+        404: {
+            "model": VcErrorResponse,
+            "description": "기기를 찾을 수 없거나 본인 소유가 아님 (DEVICE_NOT_FOUND)",
+        },
     },
 )
 async def bind_holder_key(
@@ -478,13 +493,13 @@ async def bind_holder_key(
     # 그 VC는 폐기 목록에도 없어 분실 기기가 키오스크를 그대로 통과한다.
     device = await db.get(Device, body.device_id, with_for_update=True)
     if device is None or device.user_id != user.id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="device not found")
+        raise api_error(VcError.DEVICE_NOT_FOUND, status.HTTP_404_NOT_FOUND)
 
     try:
         pub = load_public_key_pem(body.holder_public_key_pem)
         pub.verify(base64.b64decode(body.proof_signature_b64), str(body.device_id).encode())
     except Exception:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="key ownership proof failed")
+        raise api_error(VcError.HOLDER_KEY_PROOF_FAILED, status.HTTP_400_BAD_REQUEST)
 
     new_holder_did = public_key_to_did_key(pub)
 
@@ -538,6 +553,7 @@ async def bind_holder_key(
     "/devices",
     response_model=list[DeviceResponse],
     summary="내 기기 목록 조회",
+    responses=AUTHENTICATED_RESPONSES,
 )
 async def list_my_devices(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """본인이 등록한 기기 목록을 조회한다."""

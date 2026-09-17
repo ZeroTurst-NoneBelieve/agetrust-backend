@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
+from app.api.errors import ADMIN_RESPONSES
 from app.core.audit import recompute_hash_for
 from app.database import get_db
 from app.models import AuditLog, User
@@ -27,7 +28,7 @@ MAX_PAGE_SIZE = 200
 MAX_VERIFY_SCAN = 10_000
 
 
-@router.get("/logs", response_model=AuditLogPage)
+@router.get("/logs", response_model=AuditLogPage, responses=ADMIN_RESPONSES)
 async def list_audit_logs(
     event_type: str | None = Query(default=None, description="정확히 일치하는 이벤트 타입"),
     actor_type: AuditActorType | None = Query(default=None),
@@ -86,7 +87,11 @@ async def list_audit_logs(
     )
 
 
-@router.get("/logs/chain-verification", response_model=ChainVerificationResponse)
+@router.get(
+    "/logs/chain-verification",
+    response_model=ChainVerificationResponse,
+    responses=ADMIN_RESPONSES,
+)
 async def verify_audit_chain(
     from_id: int | None = Query(default=None, description="이 id부터 (포함)"),
     to_id: int | None = Query(default=None, description="이 id까지 (포함)"),
