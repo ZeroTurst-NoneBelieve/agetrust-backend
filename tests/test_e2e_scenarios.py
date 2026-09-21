@@ -151,9 +151,9 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         기존 행은 조회하거나 수정하지 않는다. 실제 등록 API를 대신하는
         fixture이며, 키 원문은 반환 헤더에만 두고 DB에는 SHA-256을 저장한다.
         """
-        from app.models import Business, Kiosk, Store
+        from app.models import Business, Kiosk, KioskApiKey, Store
 
-        raw_key = secrets.token_urlsafe(32)
+        raw_key = f"ak_{secrets.token_urlsafe(32)}"
         identifier = _unique("e2e-kiosk-")
         async with self.session_factory() as db:
             business = Business(
@@ -174,10 +174,16 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             kiosk = Kiosk(
                 store_id=store.id,
                 kiosk_identifier=identifier,
-                api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
                 status="ACTIVE",
             )
             db.add(kiosk)
+            await db.flush()
+            db.add(KioskApiKey(
+                kiosk_id=kiosk.id,
+                key_prefix=raw_key[:8],
+                key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+                status="ACTIVE",
+            ))
             await db.commit()
             return kiosk.id, {"Authorization": f"Bearer {raw_key}"}
 
@@ -400,10 +406,8 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         async with self.session_factory() as db:
             other_kiosk = await db.get(Kiosk, other_kiosk_id)
             other_kiosk.status = "INACTIVE"
-            other_key_hash = other_kiosk.api_key_hash
             kiosk = await db.get(Kiosk, kiosk_id)
             kiosk_identifier = kiosk.kiosk_identifier
-            kiosk_key_hash = kiosk.api_key_hash
             await db.commit()
         raw_kiosk_key = kiosk_headers["Authorization"].removeprefix("Bearer ")
         status_list_id = status_path.rsplit("/", 1)[-1]
@@ -449,31 +453,25 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.headers["cache-control"], "private, no-cache")
         self.assertIn("authorization", r.headers["vary"].lower())
 
-        # 같은 키 해시가 두 행에 있으면 임의의 키오스크로 인증하지 않는다.
-        # DB의 UNIQUE 여부에 기대지 않고, 실제 PostgreSQL의 중복 행으로 확인한다.
-        try:
-            async with self.session_factory() as db:
-                other_kiosk = await db.get(Kiosk, other_kiosk_id)
-                other_kiosk.api_key_hash = kiosk_key_hash
-                other_kiosk.status = "ACTIVE"
-                await db.commit()
-            for path in (status_path, legacy_status_path):
-                for etag in (None, initial_etag):
-                    headers = dict(kiosk_headers)
-                    if etag is not None:
-                        headers["If-None-Match"] = etag
-                    with self.subTest(path=path, duplicate_key=True, conditional=etag is not None):
-                        r = await self.client.get(path, headers=headers)
-                        self.assertEqual(r.status_code, 401, r.text)
-                        self.assertEqual(r.json()["detail"]["code"], "KIOSK_KEY_INVALID")
-                        self.assertEqual(r.headers["cache-control"], "no-store")
-        finally:
-            async with self.session_factory() as db:
-                other_kiosk = await db.get(Kiosk, other_kiosk_id)
-                other_kiosk.api_key_hash = other_key_hash
-                await db.commit()
+        # DB의 UNIQUE 제약이 같은 평문 키를 다른 키오스크에 중복 등록하지 못하게 한다.
+        from app.models import KioskApiKey
+        from sqlalchemy.exc import IntegrityError
 
-        # 중복을 해소하면 두 키 모두 자신의 키오스크를 찾아 정상 인증된다.
+        with self.assertRaises(IntegrityError):
+            async with self.session_factory() as db:
+                db.add(KioskApiKey(
+                    kiosk_id=other_kiosk_id,
+                    key_prefix=raw_kiosk_key[:8],
+                    key_hash=hashlib.sha256(raw_kiosk_key.encode()).hexdigest(),
+                    status="ACTIVE",
+                ))
+                await db.flush()
+
+        # 중복 저장 시도 후에도 기존 두 키는 자신의 키오스크로 정상 인증된다.
+        async with self.session_factory() as db:
+            other_kiosk = await db.get(Kiosk, other_kiosk_id)
+            other_kiosk.status = "ACTIVE"
+            await db.commit()
         for headers in (kiosk_headers, other_kiosk_headers):
             r = await self.client.get(
                 status_path, headers={**headers, "If-None-Match": initial_etag}
