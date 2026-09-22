@@ -245,9 +245,10 @@ class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
         from app.models import User
 
         phone = self._new_phone()
-        first, second = await asyncio.gather(
-            self._verified_verification_id(phone), self._verified_verification_id(phone)
-        )
+        # 인증 준비는 순서대로 마쳐 재전송 쿨다운과 경합하지 않게 한다.
+        # 실제 가입은 아래 게이트에서 동시에 INSERT하도록 맞춘다.
+        first = await self._verified_verification_id(phone)
+        second = await self._verified_verification_id(phone)
 
         self.flush_gate = _FlushGate(2)
         responses = await asyncio.gather(

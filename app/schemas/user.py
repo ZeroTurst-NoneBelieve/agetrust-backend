@@ -8,9 +8,9 @@ class PhoneRequestBody(BaseModel):
     """전화번호 인증 요청."""
 
     phone_number: str = Field(
-        pattern=r"^\+[1-9]\d{6,14}$",
+        pattern=r"^\+8210\d{8}$",
         examples=["+821012345678"],
-        description="E.164 형식. 국가번호를 포함하고 + 로 시작한다.",
+        description="대한민국 휴대전화의 E.164 형식(+8210XXXXXXXX).",
     )
 
 
@@ -19,7 +19,8 @@ class PhoneRequestResponse(BaseModel):
 
     verification_id: str = Field(
         description=(
-            "인증 요청 식별자(UUID). 이후 verify·signup 요청에 그대로 전달한다."
+            "발급마다 새로 생성되는 인증 요청 식별자(UUID). 재발급 성공 시 "
+            "이전 미검증 요청은 만료된다. 최신 ID를 verify·signup에 전달한다."
         ),
         examples=["9d65e6a3-3f06-4ce2-9928-7359667a9577"],
     )
@@ -43,7 +44,11 @@ class PhoneVerifyBody(BaseModel):
         examples=["9d65e6a3-3f06-4ce2-9928-7359667a9577"],
     )
     otp: str = Field(
-        description="SMS로 수신한 인증번호.",
+        max_length=64,
+        description=(
+            "SMS로 수신한 6자리 인증번호. 길이·문자가 틀린 입력도 검증 경로에서 "
+            "401 OTP_MISMATCH로 처리한다(요청 문자열 상한 64자)."
+        ),
         examples=["792330"],
     )
 
