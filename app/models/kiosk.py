@@ -23,7 +23,6 @@ class Kiosk(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     store_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stores.id"), nullable=False)
     kiosk_identifier: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
-    api_key_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, server_default="ACTIVE")
     software_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
