@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -57,6 +58,34 @@ logger = logging.getLogger(__name__)
 def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
     """인증 실패가 기본이라 401을 기본값으로 둔다. 본문 형태는 공용 생성기가 정한다."""
     return api_error(code, status_code)
+
+
+# users의 UNIQUE 제약 이름 -> 클라이언트가 분기할 오류 코드.
+# 사전 확인과 DB 제약이 같은 코드를 내도록 한 곳에 묶어 둔다.
+_UNIQUE_CONFLICTS = {
+    "users_phone_number_key": AuthError.PHONE_ALREADY_REGISTERED,
+    "users_login_id_key": AuthError.USER_ALREADY_EXISTS,
+}
+
+
+def _conflicting_unique(error: IntegrityError) -> AuthError | None:
+    """UNIQUE 위반이 어느 제약에서 났는지 보고 오류 코드를 고른다.
+
+    제약 이름이 드라이버마다 다른 자리에 실린다. asyncpg 어댑터는 error.orig에
+    constraint_name을 달지 않고 원래 예외를 __cause__로 걸어 두고(실측),
+    psycopg2는 diag.constraint_name을 준다. 둘 다 없으면 메시지에 남은
+    이름으로 떨어진다. 알 수 없는 제약이면 None을 주어 그대로 올라가게 한다.
+    """
+    orig = error.orig
+    name = (
+        getattr(orig, "constraint_name", None)
+        or getattr(getattr(orig, "diag", None), "constraint_name", None)
+        or getattr(getattr(orig, "__cause__", None), "constraint_name", None)
+    )
+    if name is None:
+        rendered = str(orig)
+        name = next((c for c in _UNIQUE_CONFLICTS if c in rendered), None)
+    return _UNIQUE_CONFLICTS.get(name)
 
 
 async def _record_phone_verification_failure(
@@ -247,7 +276,10 @@ async def verify_phone_otp(body: PhoneVerifyBody, db: AsyncSession = Depends(get
         },
         409: {
             "model": AuthErrorResponse,
-            "description": "이미 존재하는 login_id",
+            "description": (
+                "이미 존재하는 login_id (USER_ALREADY_EXISTS) 또는 "
+                "이미 가입된 전화번호 (PHONE_ALREADY_REGISTERED)"
+            ),
         },
     },
 )
@@ -270,6 +302,15 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
     if existing.scalar_one_or_none():
         raise _fail(AuthError.USER_ALREADY_EXISTS, status.HTTP_409_CONFLICT)
 
+    # phone_number도 UNIQUE라 DB가 막지만, 걸러 두지 않으면 제약 위반이 그대로
+    # 500으로 올라가 모바일이 "서버 오류"로 안내한다(#49). 탈퇴한 계정의 번호도
+    # 제약에 남아 있으므로 status·withdrawn_at으로 좁히지 않는다.
+    registered = await db.execute(
+        select(User.id).where(User.phone_number == verification.phone_number)
+    )
+    if registered.scalar_one_or_none() is not None:
+        raise _fail(AuthError.PHONE_ALREADY_REGISTERED, status.HTTP_409_CONFLICT)
+
     user = User(
         login_id=body.login_id,
         password_hash=hash_password(body.password),
@@ -281,19 +322,30 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
     )
     db.add(user)
     verification.consumed_at = datetime.now(timezone.utc)
-    await db.flush()  # audit의 aggregate_id로 쓸 user.id 확보
+    try:
+        # users INSERT가 나가는 지점이다. 같은 번호·아이디로 동시에 들어온
+        # 가입(모바일 가입 버튼 이중 탭이 그렇다)은 위의 사전 확인을 둘 다
+        # 통과한 뒤 여기서 UNIQUE 제약에 걸린다. 사전 확인과 같은 409로
+        # 맞춰야 이 경로에서도 500이 나지 않는다.
+        await db.flush()  # audit의 aggregate_id로 쓸 user.id 확보
 
-    await record_audit_event(
-        db,
-        event_type=AuditEventType.USER_SIGNED_UP.value,
-        actor_type=AuditActorType.USER.value,
-        actor_ref=str(user.id),
-        aggregate_type=AuditAggregateType.USER.value,
-        aggregate_id=str(user.id),
-        payload={"login_id": user.login_id, "phone": mask_phone(user.phone_number)},
-    )
-    # users INSERT + phone_verification_requests UPDATE + audit을 한 트랜잭션으로 커밋
-    await db.commit()
+        await record_audit_event(
+            db,
+            event_type=AuditEventType.USER_SIGNED_UP.value,
+            actor_type=AuditActorType.USER.value,
+            actor_ref=str(user.id),
+            aggregate_type=AuditAggregateType.USER.value,
+            aggregate_id=str(user.id),
+            payload={"login_id": user.login_id, "phone": mask_phone(user.phone_number)},
+        )
+        # users INSERT + phone_verification_requests UPDATE + audit을 한 트랜잭션으로 커밋
+        await db.commit()
+    except IntegrityError as error:
+        await db.rollback()
+        conflict = _conflicting_unique(error)
+        if conflict is None:
+            raise
+        raise _fail(conflict, status.HTTP_409_CONFLICT) from None
     await db.refresh(user)
     return user
 
