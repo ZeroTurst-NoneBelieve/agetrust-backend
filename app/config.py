@@ -1,5 +1,6 @@
 import logging
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,12 @@ class Settings(BaseSettings):
     otp_length: int = 6
     otp_expire_minutes: int = 5
     otp_max_attempts: int = 5
+    # SOLAPI — DEV_MODE=false일 때 전화번호 인증 OTP를 실제 문자로 보낸다.
+    # 앱 기동 자체는 개발·테스트에서도 가능해야 하므로 선택값으로 읽고,
+    # 실제 발송 직전에 세 값이 모두 있는지 검증한다.
+    solapi_api_key: SecretStr | None = None
+    solapi_api_secret: SecretStr | None = None
+    solapi_sender: str | None = None
     vc_expire_days: int = 365
     # VC 본문의 credentialStatus에 박히는 공개 URL의 기준 주소.
     # 키오스크가 상태 목록을 조회할 주소이고, 한번 발급된 VC 안에는
