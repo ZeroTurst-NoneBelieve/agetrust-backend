@@ -8,6 +8,8 @@
 1. 이미 가입된 번호로 가입하면 409 + PHONE_ALREADY_REGISTERED (이전에는 500)
 2. 같은 번호로 동시에 들어온 가입 두 건 중 하나만 성공하고, 나머지도 500이 아니다
 3. 탈퇴한 계정의 번호도 제약에 남아 있으므로 같은 409로 막힌다
+
+만든 행은 테스트마다 `_remove_owned_rows`로 되돌린다.
 """
 
 import asyncio
@@ -24,10 +26,6 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
 
-def _phone():
-    return f"+8210{uuid.uuid4().int % 10**8:08d}"
-
-
 def _login_id():
     return f"dup-{uuid.uuid4().hex[:12]}"
 
@@ -36,17 +34,26 @@ def _login_id():
 class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         import httpx
+        from sqlalchemy import func, select
         from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
         from app.config import settings
         from app.database import get_db
         from app.main import app
+        from app.models import AuditLog, OutboxEvent
 
         # 앱 엔진은 임포트 시점의 DATABASE_URL에 묶인다. discover로 돌리면 먼저
         # 임포트된 단위 테스트의 자리표시자가 잡히므로 전용 엔진으로 갈아끼운다.
         self.engine = create_async_engine(E2E_DB_URL, echo=False)
         self.addAsyncCleanup(self.engine.dispose)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+
+        # 정리 기준점. 이 테스트가 넣은 행만 골라내려고 현재 tip을 잡아 둔다.
+        self.created_phones = []
+        async with self.session_factory() as db:
+            self.audit_tip = await db.scalar(select(func.max(AuditLog.id)))
+            self.outbox_tip = await db.scalar(select(func.max(OutboxEvent.id)))
+        self.addAsyncCleanup(self._remove_owned_rows)
 
         async def _override_get_db():
             async with self.session_factory() as session:
@@ -66,6 +73,41 @@ class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
             transport=httpx.ASGITransport(app=app), base_url="http://signup-conflict"
         )
         self.addAsyncCleanup(self.client.aclose)
+
+    async def _remove_owned_rows(self):
+        """이 테스트가 넣은 행을 되돌린다.
+
+        users·phone_verification_requests는 번호로 고른다. 번호는 테스트마다 새로
+        만들므로 다른 데이터와 겹치지 않는다.
+
+        audit_logs·outbox_events는 기준점보다 뒤만 지운다. 감사 로그는
+        `previous_hash`로 이어진 체인이라 중간을 파내면 체인 검증이 LINK_MISMATCH로
+        잡는다(`app/api/v1/endpoints/admin.py:104`, 구간 지정 없이 전체를 훑는
+        `tests/test_e2e_scenarios.py:375`). 꼬리만 잘라내면 남은 행의 연결은
+        그대로다. 테스트는 한 프로세스에서 차례로 도므로 기준점 뒤의 행은 이
+        테스트가 넣은 것뿐이다.
+        """
+        from sqlalchemy import delete
+
+        from app.models import AuditLog, OutboxEvent, PhoneVerificationRequest, User
+
+        async with self.session_factory() as db:
+            await db.execute(delete(AuditLog).where(AuditLog.id > (self.audit_tip or 0)))
+            await db.execute(delete(OutboxEvent).where(OutboxEvent.id > (self.outbox_tip or 0)))
+            if self.created_phones:
+                await db.execute(
+                    delete(PhoneVerificationRequest).where(
+                        PhoneVerificationRequest.phone_number.in_(self.created_phones)
+                    )
+                )
+                await db.execute(delete(User).where(User.phone_number.in_(self.created_phones)))
+            await db.commit()
+
+    def _new_phone(self):
+        """정리 대상으로 기록하면서 번호를 하나 만든다."""
+        phone = f"+8210{uuid.uuid4().int % 10**8:08d}"
+        self.created_phones.append(phone)
+        return phone
 
     async def _verified_verification_id(self, phone):
         """phone/request -> phone/verify까지 통과한 인증 건을 만든다."""
@@ -99,7 +141,7 @@ class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
         return response.json()["id"]
 
     async def test_already_registered_phone_returns_409_not_500(self):
-        phone = _phone()
+        phone = self._new_phone()
         await self._registered_user(phone)
 
         # 같은 번호로 인증을 새로 받아 다시 가입한다. 이전에는 이 지점에서
@@ -116,7 +158,7 @@ class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         from app.models import User
 
-        phone = _phone()
+        phone = self._new_phone()
         user_id = await self._registered_user(phone)
         async with self.session_factory() as db:
             await db.execute(
@@ -142,7 +184,7 @@ class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         from app.models import User
 
-        phone = _phone()
+        phone = self._new_phone()
         first, second = await asyncio.gather(
             self._verified_verification_id(phone), self._verified_verification_id(phone)
         )
