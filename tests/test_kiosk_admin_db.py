@@ -1,6 +1,6 @@
 """전용 PostgreSQL에서 키오스크 발급·인증·회전·폐기를 실제 HTTP로 검증한다.
 
-E2E_DATABASE_URL의 DB 이름에 ``e2e``가 있어야 실행한다. 모든 요청은 외부
+전용 테스트 DB의 E2E_DATABASE_URL이 설정되어 있으면 실행한다. 모든 요청은 외부
 트랜잭션의 SAVEPOINT에서 실행하고 테스트 끝에 외부 트랜잭션을 롤백한다.
 따라서 키오스크·키·감사 로그·Outbox 등 이 테스트가 만든 행이 남지 않는다.
 """
@@ -15,12 +15,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 E2E_DB_URL = os.environ.get("E2E_DATABASE_URL")
-E2E_DB_NAME = make_url(E2E_DB_URL).database if E2E_DB_URL else ""
-RUN_E2E = bool(E2E_DB_URL and E2E_DB_NAME and "e2e" in E2E_DB_NAME.lower())
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
@@ -42,7 +39,7 @@ from app.models import (  # noqa: E402
 )
 
 
-@unittest.skipUnless(RUN_E2E, "키 관리 E2E는 이름에 e2e가 포함된 전용 E2E_DATABASE_URL이 필요하다")
+@unittest.skipUnless(E2E_DB_URL, "키 관리 E2E에는 전용 E2E_DATABASE_URL이 필요하다")
 class KioskAdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.engine = create_async_engine(E2E_DB_URL, echo=False)

@@ -16,12 +16,9 @@ from unittest.mock import patch
 
 from fastapi import Response
 from sqlalchemy import delete, select
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 E2E_DB_URL = os.environ.get("E2E_DATABASE_URL")
-E2E_DB_NAME = make_url(E2E_DB_URL).database if E2E_DB_URL else ""
-RUN_E2E = bool(E2E_DB_NAME and "e2e" in E2E_DB_NAME.lower())
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
@@ -32,7 +29,7 @@ from app.core import kiosk_key_cleanup  # noqa: E402
 from app.models import AuditLog, Business, Kiosk, KioskApiKey, OutboxEvent, Store  # noqa: E402
 
 
-@unittest.skipUnless(RUN_E2E, "잠금 경합 검증에는 전용 E2E_DATABASE_URL이 필요하다")
+@unittest.skipUnless(E2E_DB_URL, "잠금 경합 검증에는 전용 E2E_DATABASE_URL이 필요하다")
 class KioskKeyConcurrencyDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.engine = create_async_engine(E2E_DB_URL, echo=False)
