@@ -48,6 +48,7 @@ from app.models import (  # noqa: E402
     CredentialStatusList,
     Device,
     Kiosk,
+    KioskApiKey,
     VcCredential,
 )
 from app.schemas.errors import VcError  # noqa: E402
@@ -539,12 +540,22 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     async def _http_get(db, path="/api/v1/status-lists/7", headers=None):
-        raw_key = "test-status-list-reader-key"
-        db.scalar_results[Kiosk] = SimpleNamespace(
+        raw_key = "ak_" + "C" * 43
+        db.rows[(Kiosk, 5)] = SimpleNamespace(
             id=5,
             kiosk_identifier="test-status-list-reader",
-            api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
             status="ACTIVE",
+        )
+        db.scalar_results[KioskApiKey] = SimpleNamespace(
+            id=6,
+            kiosk_id=5,
+            key_prefix=raw_key[:8],
+            key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+            status="ACTIVE",
+            created_at=datetime.now(timezone.utc),
+            expires_at=None,
+            revoked_at=None,
+            last_used_at=None,
         )
         request_headers = httpx.Headers(headers)
         request_headers["Authorization"] = f"Bearer {raw_key}"

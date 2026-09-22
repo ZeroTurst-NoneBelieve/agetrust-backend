@@ -132,17 +132,52 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 E2E는 테이블에 실제로 쓰기를 하므로 운영 DB를 가리키지 마세요.
 
-상태 목록은 `Authorization: Bearer <api_key>`로 등록된 ACTIVE 키오스크만
-조회할 수 있습니다. 기존 `/api/v1/status/{id}` 경로에도 같은 인증이 필요합니다.
-API Key 원문만 보내며 사용자 로그인 JWT나 `식별자:키` 형식이 아닙니다.
-이전 `X-Kiosk-Key` 방식은 지원하지 않습니다.
-**키를 발급·배포·회전하는 경로는 아직 없습니다** — 이슈 #46에서 다룹니다.
-지금은 `kiosks` 행을 직접 넣지 않으면 이 엔드포인트가 누구에게나 401입니다.
-키오스크 K-6 담당자와 연동할 때는 `agetrust-docs`(팀 전용)의
+## 7. 키오스크 등록과 API Key 현장 주입
+
+관리자 API를 쓰려면 먼저 승인된 관리자 계정이 필요합니다. 공개 회원가입은 `USER`만 생성하므로
+관리자 권한은 셀프서비스로 부여하지 않습니다. 팀에서 권한 부여를 승인한 뒤, DB 접근 권한이
+있는 운영자가 **이미 가입하고 휴대전화 확인을 마친 ACTIVE 계정**의 내부 `id`를 확인하여
+해당 계정만 `ADMIN`으로 승격합니다. 승인 내역과 작업자를 팀 운영 기록에 남기고, 공용 계정은
+만들지 마세요. 예를 들어 `<approved_user_id>`를 승인된 계정의 숫자 ID로 바꾼 뒤 DB 콘솔에서
+다음을 실행할 수 있습니다.
+
+```sql
+UPDATE users
+SET platform_role = 'ADMIN', updated_at = now()
+WHERE id = <approved_user_id>
+  AND status = 'ACTIVE'
+  AND phone_verified_at IS NOT NULL
+RETURNING id, platform_role;
+```
+
+`RETURNING`이 1건인지 확인하고, 그 계정으로 다시 로그인해 관리자 JWT를 받습니다. 이 JWT는
+관리자 API 호출에만 사용하고 키오스크에 설치하지 않습니다.
+
+1. `POST /api/v1/admin/kiosks`에 `{"store_id": <store_id>}`를 보내 등록합니다. 응답에는
+   `kiosk_identifier`와 **한 번만 표시되는** `key.api_key`가 함께 들어 있습니다.
+2. 승인된 설치 담당자가 두 값을 현장 키오스크의 보안 설정에 주입합니다. 관제 웹 QR 화면이
+   준비되기 전 개발 시연에서는 응답 화면에서 직접 입력합니다. 응답·QR·평문 키를 파일,
+   채팅, 로그, 화면 캡처에 보관하지 마세요. 화면을 벗어나면 원문은 다시 조회할 수 없습니다.
+   새 키는 발급 후 24시간 안에 한 번 인증해야 합니다. 그때까지 쓰지 않은 키는 자동
+   폐기되고 인증 요청도 거부되므로, 설치가 늦어졌다면 새 키를 발급하세요.
+3. 키오스크는 상태 목록 조회에 `Authorization: Bearer <api_key>`를 보냅니다. 기존
+   `/api/v1/status/{id}` 별칭에도 같은 인증이 필요합니다. 사용자 로그인 JWT,
+   `식별자:키`, 이전 `X-Kiosk-Key` 헤더는 사용하지 않습니다.
+4. 회전할 때는 `POST /api/v1/admin/kiosks/{kiosk_identifier}/keys`에 `{}`를 보내 새 키를 발급하고
+   먼저 키오스크에 주입합니다. 두 키가 함께 유효한 동안 전환한 뒤,
+   `GET /api/v1/admin/kiosks/{kiosk_identifier}/keys`의 `last_used_at`으로 구 키 사용 중단을
+   확인합니다. 필요하면 `PATCH /api/v1/admin/kiosks/{kiosk_identifier}/keys/{key_id}`에
+   `{"expires_at": "<ISO 8601 미래 시각>"}`을 보내 구 키의 만료 시각을 정하고,
+   `POST /api/v1/admin/kiosks/{kiosk_identifier}/keys/{key_id}/revoke`로 최종 폐기합니다.
+
+마이그레이션 전의 유일한 정상 키 해시는 `legacy__` 표식으로 보존되지만 원문은 복구할 수
+없습니다. 동일한 해시가 여러 키오스크에 있던 경우는 기존에도 인증이 거부됐으므로 옮기지
+않습니다. 이런 키오스크에는 관리자 API로 새 키를 발급해 주입해야 합니다. 키오스크 K-6
+담당자와 연동할 때는 `agetrust-docs`(팀 전용)의
 [StatusList 폐기 목록 조회 API](https://github.com/ZeroTurst-NoneBelieve/agetrust-docs/blob/main/api-specs/status-list-api.md)를
 참고하세요. 문서 정본은 그쪽입니다.
 
-## 7. CI
+## 8. CI
 
 `dev`/`main` 대상 PR과 두 브랜치로의 push에서 `.github/workflows/ci.yml`이 돕니다.
 

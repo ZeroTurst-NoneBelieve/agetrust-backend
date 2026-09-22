@@ -54,6 +54,6 @@ ADMIN_RESPONSES = {
     **AUTHENTICATED_RESPONSES,
     403: {
         "model": AuthErrorResponse,
-        "description": "platform_role이 ADMIN이 아님 (PERMISSION_DENIED)",
+        "description": "ADMIN 권한이 없거나 계정이 비활성 상태 (PERMISSION_DENIED)",
     },
 }
