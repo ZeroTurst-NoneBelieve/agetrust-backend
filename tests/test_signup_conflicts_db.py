@@ -1,0 +1,167 @@
+"""실제 PostgreSQL에서 가입 중복 충돌을 확인한다 (#49).
+
+이 버그는 DB의 UNIQUE 제약에서 났으므로 대역으로는 재현되지 않는다.
+`E2E_DATABASE_URL`이 있을 때만 켜지며, 관례는 tests/test_status_list_db.py와 같다.
+
+세 가지를 본다.
+
+1. 이미 가입된 번호로 가입하면 409 + PHONE_ALREADY_REGISTERED (이전에는 500)
+2. 같은 번호로 동시에 들어온 가입 두 건 중 하나만 성공하고, 나머지도 500이 아니다
+3. 탈퇴한 계정의 번호도 제약에 남아 있으므로 같은 409로 막힌다
+"""
+
+import asyncio
+import base64
+import os
+import unittest
+import uuid
+from datetime import datetime, timezone
+
+E2E_DB_URL = os.environ.get("E2E_DATABASE_URL")
+
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
+os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
+
+
+def _phone():
+    return f"+8210{uuid.uuid4().int % 10**8:08d}"
+
+
+def _login_id():
+    return f"dup-{uuid.uuid4().hex[:12]}"
+
+
+@unittest.skipUnless(E2E_DB_URL, "실제 PostgreSQL 검증에는 E2E_DATABASE_URL이 필요하다")
+class SignupConflictDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import httpx
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.config import settings
+        from app.database import get_db
+        from app.main import app
+
+        # 앱 엔진은 임포트 시점의 DATABASE_URL에 묶인다. discover로 돌리면 먼저
+        # 임포트된 단위 테스트의 자리표시자가 잡히므로 전용 엔진으로 갈아끼운다.
+        self.engine = create_async_engine(E2E_DB_URL, echo=False)
+        self.addAsyncCleanup(self.engine.dispose)
+        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+
+        async def _override_get_db():
+            async with self.session_factory() as session:
+                yield session
+
+        self.app = app
+        app.dependency_overrides[get_db] = _override_get_db
+        self.addCleanup(app.dependency_overrides.pop, get_db, None)
+
+        # 가입 흐름이 OTP를 응답으로 받아야 이어진다. settings는 이미 만들어져
+        # 있어서 환경변수로는 켜지지 않으므로 직접 켜고 되돌린다.
+        self._dev_mode_before = settings.dev_mode
+        settings.dev_mode = True
+        self.addCleanup(setattr, settings, "dev_mode", self._dev_mode_before)
+
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://signup-conflict"
+        )
+        self.addAsyncCleanup(self.client.aclose)
+
+    async def _verified_verification_id(self, phone):
+        """phone/request -> phone/verify까지 통과한 인증 건을 만든다."""
+        response = await self.client.post("/api/v1/auth/phone/request", json={"phone_number": phone})
+        self.assertEqual(response.status_code, 200, response.text)
+        verification_id = response.json()["verification_id"]
+        otp = response.json()["dev_otp"]
+
+        response = await self.client.post(
+            "/api/v1/auth/phone/verify",
+            json={"verification_id": verification_id, "otp": otp},
+        )
+        self.assertEqual(response.status_code, 204, response.text)
+        return verification_id
+
+    async def _signup(self, verification_id, login_id):
+        return await self.client.post(
+            "/api/v1/auth/signup",
+            json={
+                "verification_id": verification_id,
+                "login_id": login_id,
+                "password": "signup-conflict-1234",
+                "name": "중복 가입 테스트",
+            },
+        )
+
+    async def _registered_user(self, phone):
+        verification_id = await self._verified_verification_id(phone)
+        response = await self._signup(verification_id, _login_id())
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["id"]
+
+    async def test_already_registered_phone_returns_409_not_500(self):
+        phone = _phone()
+        await self._registered_user(phone)
+
+        # 같은 번호로 인증을 새로 받아 다시 가입한다. 이전에는 이 지점에서
+        # UniqueViolationError가 500으로 올라갔다.
+        second = await self._verified_verification_id(phone)
+        response = await self._signup(second, _login_id())
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "PHONE_ALREADY_REGISTERED")
+
+    async def test_withdrawn_account_phone_is_also_a_conflict(self):
+        """탈퇴해도 번호는 UNIQUE에 남는다. 사전 확인이 이 행까지 봐야 500이 안 난다."""
+        from sqlalchemy import update
+
+        from app.models import User
+
+        phone = _phone()
+        user_id = await self._registered_user(phone)
+        async with self.session_factory() as db:
+            await db.execute(
+                update(User)
+                .where(User.id == user_id)
+                .values(withdrawn_at=datetime.now(timezone.utc), status="WITHDRAWN")
+            )
+            await db.commit()
+
+        second = await self._verified_verification_id(phone)
+        response = await self._signup(second, _login_id())
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "PHONE_ALREADY_REGISTERED")
+
+    async def test_concurrent_signups_for_one_phone_leave_a_single_user(self):
+        """사전 확인을 둘 다 통과하는 경합에서도 500이 나지 않아야 한다.
+
+        같은 번호로 인증 건 두 개를 받아 동시에 가입을 넣는다. 모바일 가입
+        버튼 이중 탭이 만드는 상황이다. 둘 중 하나는 DB 제약에서 걸린다.
+        """
+        from sqlalchemy import func, select
+
+        from app.models import User
+
+        phone = _phone()
+        first, second = await asyncio.gather(
+            self._verified_verification_id(phone), self._verified_verification_id(phone)
+        )
+
+        responses = await asyncio.gather(
+            self._signup(first, _login_id()), self._signup(second, _login_id())
+        )
+        codes = sorted(response.status_code for response in responses)
+
+        self.assertEqual(codes, [200, 409], [r.text for r in responses])
+        conflicted = next(r for r in responses if r.status_code == 409)
+        self.assertEqual(conflicted.json()["detail"]["code"], "PHONE_ALREADY_REGISTERED")
+
+        async with self.session_factory() as db:
+            registered = await db.execute(
+                select(func.count()).select_from(User).where(User.phone_number == phone)
+            )
+            self.assertEqual(registered.scalar_one(), 1, "번호당 계정은 하나만 남아야 한다")
+
+
+if __name__ == "__main__":
+    unittest.main()
