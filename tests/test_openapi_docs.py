@@ -57,6 +57,9 @@ class OpenApiContractTests(unittest.TestCase):
 
     def test_auth_error_responses_expose_detail_code_schema(self):
         responses = (
+            ("/api/v1/auth/phone/request", "429"),
+            ("/api/v1/auth/phone/request", "502"),
+            ("/api/v1/auth/phone/request", "503"),
             ("/api/v1/auth/phone/verify", "401"),
             ("/api/v1/auth/phone/verify", "404"),
             ("/api/v1/auth/signup", "409"),
@@ -78,6 +81,13 @@ class OpenApiContractTests(unittest.TestCase):
         code = self.schemas["AuthErrorDetail"]["properties"]["code"]
         self.assertEqual(detail["$ref"], "#/components/schemas/AuthErrorDetail")
         self.assertEqual(code["$ref"], "#/components/schemas/AuthError")
+
+    def test_phone_request_documents_retry_after_header(self):
+        response = self.openapi["paths"]["/api/v1/auth/phone/request"]["post"][
+            "responses"
+        ]["429"]
+
+        self.assertEqual(response["headers"]["Retry-After"]["schema"]["type"], "integer")
 
 
     def test_vc_error_responses_expose_detail_code_schema(self):

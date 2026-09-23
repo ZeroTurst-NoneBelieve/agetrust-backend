@@ -1,5 +1,6 @@
 import logging
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -33,9 +34,27 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
-    otp_length: int = 6
+    # 발급 OTP는 6자리 ASCII 숫자다. 앱의 입력 길이와 다른 OTP가 발급되는
+    # 구성을 시작 단계에서 막는다. 틀린 사용자 입력은 검증 API에서 처리한다.
+    otp_length: int = Field(default=6, ge=6, le=6)
     otp_expire_minutes: int = 5
     otp_max_attempts: int = 5
+    otp_resend_cooldown_seconds: int = 30
+    otp_max_resends: int = 5
+    # 실제 문자 발송량 보호. 현재 단일 FastAPI 프로세스의 메모리에서 센다.
+    otp_request_limit_per_client: int = 10
+    otp_request_limit_window_seconds: int = 600
+    otp_request_limit_per_recipient: int = 6
+    otp_request_recipient_window_seconds: int = 3600
+    otp_request_global_limit: int = 100
+    otp_request_global_window_seconds: int = 3600
+
+    # SOLAPI — DEV_MODE=false일 때 전화번호 인증 OTP를 실제 문자로 보낸다.
+    # 앱 기동 자체는 개발·테스트에서도 가능해야 하므로 선택값으로 읽고,
+    # 실제 발송 직전에 세 값이 모두 있는지 검증한다.
+    solapi_api_key: SecretStr | None = None
+    solapi_api_secret: SecretStr | None = None
+    solapi_sender: str | None = None
     vc_expire_days: int = 365
     # VC 본문의 credentialStatus에 박히는 공개 URL의 기준 주소.
     # 키오스크가 상태 목록을 조회할 주소이고, 한번 발급된 VC 안에는
@@ -44,7 +63,7 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     challenge_expire_seconds: int = 120
 
-    # 개발 편의 기능(OTP 응답 노출, 콘솔 출력) 스위치.
+    # 개발 편의 기능(SOLAPI 발송 생략, OTP 응답 노출) 스위치.
     # 기본값을 False로 두어, 명시적으로 켜지 않는 한 인증번호가
     # 응답이나 로그로 새어 나가지 않도록 한다.
     # 로컬 개발 시에만 .env에 DEV_MODE=true 를 넣어 사용한다.
