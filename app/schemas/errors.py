@@ -96,6 +96,21 @@ class AdultVerificationStatus(StrEnum):
     ERROR = "ERROR"
 
 
+class KioskResultError(StrEnum):
+    INVALID_VERIFICATION_RESULT = "INVALID_VERIFICATION_RESULT"
+    KIOSK_IDENTIFIER_MISMATCH = "KIOSK_IDENTIFIER_MISMATCH"
+    KIOSK_RESULT_PAYLOAD_MISMATCH = "KIOSK_RESULT_PAYLOAD_MISMATCH"
+    VERIFICATION_RESULT_UNAVAILABLE = "VERIFICATION_RESULT_UNAVAILABLE"
+
+
+class KioskResultErrorDetail(BaseModel):
+    code: KioskResultError
+
+
+class KioskResultErrorResponse(BaseModel):
+    detail: KioskResultErrorDetail
+
+
 class AdultVerificationFailureCode(StrEnum):
     AGE_POLICY_FAILED = "AGE_POLICY_FAILED"
     ID_SELFIE_MISMATCH = "ID_SELFIE_MISMATCH"
