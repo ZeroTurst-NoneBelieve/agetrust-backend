@@ -177,7 +177,70 @@ RETURNING id, platform_role;
 [StatusList 폐기 목록 조회 API](https://github.com/ZeroTurst-NoneBelieve/agetrust-docs/blob/main/api-specs/status-list-api.md)를
 참고하세요. 문서 정본은 그쪽입니다.
 
-## 8. CI
+## 8. 키오스크 검증 결과 업로드 (#42)
+
+현장 판정이 끝나면 키오스크가 `POST /api/v1/kiosk/verification-results`로 결과를 전송합니다.
+헤더는 `Authorization: Bearer <api_key>`이며, 등록할 때 받은 키오스크 API Key를 사용합니다.
+본문의 `kiosk_identifier`는 그 키로 인증된 키오스크와 일치해야 합니다.
+
+```json
+{
+  "kiosk_identifier": "<등록 응답의 kiosk_identifier>",
+  "nonce": "AAECAwQFBgcICQoLDA0ODw",
+  "verified_at": "2026-09-22T15:00:00+09:00",
+  "result_status": "PASS",
+  "is_vc_valid": true,
+  "is_vp_valid": true,
+  "is_face_matched": true,
+  "failure_code": null,
+  "transport_type": "QR_BLE",
+  "face_model_version": "mobilefacenet-v1",
+  "threshold_version": "t-0.62",
+  "status_list_age_seconds": 120
+}
+```
+
+위 nonce는 문서용 값입니다. 실제 판정에서는 키오스크가 해당 세션에 생성한 nonce를 사용하고,
+같은 결과를 재전송할 때는 nonce와 본문을 그대로 유지합니다. 서버는 nonce 문자열의 UTF-8
+SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 중복도 한 번만 기록합니다.
+결과·감사 이벤트(`VERIFICATION_RESULT_RECORDED`)·Outbox는 같은 트랜잭션에서 저장됩니다.
+
+| 응답 | 의미 / 키오스크 동작 |
+|---|---|
+| `201` | 신규 저장 성공, 큐에서 제거 |
+| `200` | 이미 저장된 동일 결과, 큐에서 제거. 새 결과·감사·Outbox는 만들지 않음 |
+| `400 INVALID_VERIFICATION_RESULT` | 잘못된 본문, 큐에서 제거하고 오류 확인 |
+| `400 KIOSK_RESULT_PAYLOAD_MISMATCH` | 같은 키오스크·nonce에 다른 본문. 기존 결과는 보존하고 오류 확인 |
+| `401` | 키 누락·무효·폐기 또는 비활성 키오스크. 큐 보존 후 재시도 중단 |
+| `403 KIOSK_IDENTIFIER_MISMATCH` | 인증 주체와 본문 식별자가 다름. 큐 보존 후 설정 확인 |
+| `503 VERIFICATION_RESULT_UNAVAILABLE` | 저장 일시 실패, 동일 본문으로 재시도 |
+
+성공 본문은 `{"id": 123, "received_at": "2026-09-22T06:00:01Z", "is_late": false}` 형태입니다.
+재전송에는 최초 저장한 영수증을 그대로 반환합니다. 같은 nonce의 **내용이 달라진 경우 400**과
+이 영수증 필드는 기존 문서에 없던 #42 구현 계약이므로 K-7 연동 시 함께 확인합니다.
+429·5xx는 30초부터 최대 1시간까지 지수 백오프로 재시도합니다. 정상 중복에 409는 반환하지 않습니다.
+
+`verified_at`은 시간대가 있는 ISO 8601 문자열이며, `received_at`은 서버가 요청을 받은 시각입니다.
+7일을 **초과**해 늦게 도착한 결과도 저장하고 `is_late=true`로 표시합니다. 시계가 잘못 설정된
+키오스크의 미래 시각도 원문 시점대로 저장하고 서버 수신 시각과 비교할 수 있게 합니다.
+
+`nonce`는 비어 있지 않은 문자열(최대 128자)로 받습니다. 생성 품질·현장 replay 방지는
+키오스크 책임이며, 업로드 API의 UNIQUE는 기록 중복만 방지합니다. `failure_code` 허용 목록은
+전송 계약에서 아직 미정이므로 최대 100자의 선택적 문자열로 받습니다. `result_status`는
+기존 DB의 `PASS`, `FAIL_EXPIRED`, `FAIL_FACE_MISMATCH`, `FAIL_INVALID_VC`, `FAIL_INVALID_VP`,
+`FAIL_REVOKED_VC`, `FAIL_CHALLENGE`, `INTERNAL_ERROR`를 사용하며 `PROTO_ERROR`는 받지 않습니다.
+
+기존 요청 예제와의 호환을 위해 `is_vp_valid` 생략 시 DB 기본값과 같은 `false`,
+`is_liveness_valid` 생략 시 `null`입니다. 실제 수행한 검증 결과는 키오스크가 명시해서 보냅니다.
+`status_list_age_seconds`는 `null` 또는 0~2147483647의 정수입니다. 모델·임계값 버전은
+선택적 문자열(최대 100자)입니다. `user_id`, VP/VC 원문, 얼굴 임베딩 등 정의되지 않은 필드는
+400으로 거절하며, 검증 오류 응답에 입력값을 다시 싣지 않습니다.
+
+`tests/test_kiosk_results_db.py`는 전용 `E2E_DATABASE_URL`이 있을 때 실제 PostgreSQL로
+인증·동시 재전송·본문 불일치·감사/Outbox 원자성을 검증합니다. 각 테스트가 만든 별도 스키마를
+끝에 제거하므로 테스트 DB 계정에 `CREATE SCHEMA` 권한이 필요합니다.
+
+## 9. CI
 
 `dev`/`main` 대상 PR과 두 브랜치로의 push에서 `.github/workflows/ci.yml`이 돕니다.
 
