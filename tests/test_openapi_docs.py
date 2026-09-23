@@ -115,6 +115,7 @@ class OpenApiContractTests(unittest.TestCase):
         allowed = {
             "#/components/schemas/AuthErrorResponse",
             "#/components/schemas/VcErrorResponse",
+            "#/components/schemas/KioskResultErrorResponse",
         }
         offenders = []
 
