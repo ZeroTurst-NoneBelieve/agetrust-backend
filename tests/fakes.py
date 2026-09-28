@@ -65,6 +65,7 @@ class FakeDb:
         self.outbox_events = []
         self.chain_tip = None
         self.commits = 0
+        self.rollbacks = 0
         self.flushes = 0
         self.get_calls = []
         self._rowcount = rowcount
@@ -162,6 +163,9 @@ class FakeDb:
 
     async def commit(self):
         self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
 
     async def refresh(self, row):
         return None

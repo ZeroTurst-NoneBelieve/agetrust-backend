@@ -2,6 +2,7 @@
 
 import hashlib
 import secrets
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -10,9 +11,10 @@ from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import api_error
+from app.core.audit import record_audit_event
 from app.core.security import TokenError, decode_login_token
 from app.database import get_db
-from app.models import Kiosk, User
+from app.models import Kiosk, KioskApiKey, User
 from app.schemas.errors import AuthError
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -50,7 +52,7 @@ async def get_current_user(
 
 
 async def require_admin(user: User = Depends(get_current_user)) -> User:
-    if user.platform_role != "ADMIN":
+    if user.platform_role != "ADMIN" or user.status != "ACTIVE":
         raise _deny(AuthError.PERMISSION_DENIED, status.HTTP_403_FORBIDDEN)
     return user
 
@@ -61,31 +63,77 @@ async def get_current_kiosk(
 ) -> Kiosk:
     """Bearer API Key로 키오스크를 찾는다. 로그인 JWT를 디코딩하지 않는다.
 
-    GET에는 식별자 본문이 없으므로 키 해시로 조회한다. #42에서도 이 인증 주체와
-    요청 본문의 kiosk_identifier가 일치하는지 별도로 확인해야 한다.
+    등록된 키의 해시와 접두사로 조회한다. 마이그레이션 전에 발급된 키는
+    접두사를 복구할 수 없어 ``legacy__`` 표식으로 보존한다. #42에서도
+    이 인증 주체와 요청 본문의 kiosk_identifier가 일치하는지 확인해야 한다.
     """
     if credentials is None:
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
     raw_key = credentials.credentials
     if not raw_key:
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-    # 아직 키별 테이블/UNIQUE가 없다. 동일 키가 여러 단말에 등록됐다면
-    # 임의의 단말로 인증하지 않고 거부한다. 두 행이면 중복 판정에 충분하다.
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    # prefix는 후보를 좁히는 용도이며 비밀이 아니다. 해시가 같더라도 접두사가
+    # 맞지 않으면 거부한다. 이전 키는 원문 접두사를 알 수 없으므로 별도 표식으로 찾는다.
     result = await db.execute(
-        select(Kiosk).where(Kiosk.api_key_hash == key_hash).limit(2)
+        select(KioskApiKey)
+        .where(
+            KioskApiKey.key_hash == key_hash,
+            KioskApiKey.key_prefix.in_((raw_key[:8], "legacy__")),
+        )
+        .limit(2)
+        .with_for_update()
     )
     try:
-        kiosk = result.scalar_one_or_none()
+        key = result.scalar_one_or_none()
     except MultipleResultsFound:
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID) from None
-    if kiosk is None:
+    if key is None:
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
 
-    if not secrets.compare_digest(key_hash.encode("ascii"), kiosk.api_key_hash.encode("utf-8")):
+    if not secrets.compare_digest(key_hash.encode("ascii"), key.key_hash.encode("utf-8")):
+        raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
+    now = datetime.now(timezone.utc)
+    if (
+        key.status != "ACTIVE"
+        or key.revoked_at is not None
+        or (key.expires_at is not None and key.expires_at <= now)
+    ):
+        raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
+
+    # 설치 중 유출된 신규 키가 장기간 남지 않도록, 한 번도 쓰이지 않은
+    # 발급 키는 24시간 뒤 폐기한다. 이전 스키마에서 옮긴 키는 사용 이력을
+    # 복원할 수 없으므로 별도 회전 대상으로 남긴다.
+    if (
+        key.key_prefix != "legacy__"
+        and key.last_used_at is None
+        and key.created_at <= now - timedelta(hours=24)
+    ):
+        key.status = "REVOKED"
+        key.revoked_at = now
+        await record_audit_event(
+            db,
+            event_type="KIOSK_KEY_AUTO_REVOKED",
+            actor_type="SYSTEM",
+            source_kiosk_id=key.kiosk_id,
+            aggregate_type="KIOSK_KEY",
+            aggregate_id=str(key.id),
+            payload={"key_id": key.id, "reason": "UNUSED_24H"},
+        )
+        await db.commit()
+        raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
+
+    kiosk = await db.get(Kiosk, key.kiosk_id)
+    if kiosk is None:
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
     if kiosk.status != "ACTIVE":
         raise _deny_kiosk(AuthError.KIOSK_INACTIVE)
+
+    # 회전 후 구 키 사용이 멈췄는지 운영자가 확인할 수 있어야 한다.
+    # 인증 의존성은 엔드포인트 본문보다 먼저 실행되므로 여기서 커밋해도
+    # 이후 비즈니스 변경을 함께 저장하지 않는다.
+    key.last_used_at = now
+    await db.commit()
     return kiosk
 
 
