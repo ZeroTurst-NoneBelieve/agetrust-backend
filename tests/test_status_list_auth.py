@@ -89,7 +89,10 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"detail": {"code": code}})
         self.assertEqual(response.headers["cache-control"], "no-store")
-        self.assertEqual(response.headers["vary"], "Authorization")
+        self.assertIn(
+            "authorization",
+            {field.strip().lower() for field in response.headers["vary"].split(",")},
+        )
         self.assertEqual(response.headers["www-authenticate"], "Bearer")
         self.assertNotIn("etag", response.headers)
         self.assertNotIn(self.RAW_KEY, response.text)
@@ -107,7 +110,10 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.headers["content-type"], "application/jwt")
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "Authorization")
+                self.assertIn(
+                    "authorization",
+                    {field.strip().lower() for field in response.headers["vary"].split(",")},
+                )
                 payload = jwt.decode(response.text, public_key, algorithms=["EdDSA"])
                 self.assertEqual(payload["vc"]["id"], self.row.status_list_url)
 
@@ -242,7 +248,10 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 304)
                 self.assertEqual(response.content, b"")
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "Authorization")
+                self.assertIn(
+                    "authorization",
+                    {field.strip().lower() for field in response.headers["vary"].split(",")},
+                )
 
     async def test_revocation_after_fetch_rejects_conditional_revalidation(self):
         initial = await self._get(self.PATHS[0], self._key_headers())
