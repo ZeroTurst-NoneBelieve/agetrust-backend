@@ -29,6 +29,7 @@ agetrust-backend/
 ├── .github/workflows/ci.yml     # CI (Lint · 테스트 자동 실행)
 ├── pyproject.toml               # ruff 린트 규칙 설정
 ├── requirements.txt             # 파이썬 의존성 패키지 목록
+├── constraints.txt              # 전이 의존성까지 고정한 설치 버전 (CI·Dockerfile 공통)
 └── requirements-dev.txt         # 개발 전용 의존성 (ruff)
 ```
 
@@ -49,10 +50,14 @@ source .venv/bin/activate
 # Windows PowerShell
 .\.venv\Scripts\Activate.ps1
 
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 ```
 
 `requirements-dev.txt`에는 린터 같은 개발 도구만 들어 있습니다. Dockerfile은 `requirements.txt`만 설치하므로 운영 이미지에는 포함되지 않습니다.
+
+**설치 버전은 `constraints.txt`가 정합니다.** `requirements.txt`는 하한만 적으므로 `-c constraints.txt` 없이 설치하면
+그날의 최신판이 들어와 CI와 다른 결과가 나올 수 있습니다(#62). CI와 Dockerfile도 같은 파일로 설치합니다.
+의존성을 올리거나 추가할 때는 `constraints.txt`를 같은 PR에서 고치고 CI로 확인합니다.
 
 ## 2. 환경변수
 
