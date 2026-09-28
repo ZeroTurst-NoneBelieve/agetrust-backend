@@ -707,7 +707,10 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.headers["content-type"], "application/jwt")
             self.assertEqual(response.headers["cache-control"], "private, no-cache")
-            self.assertEqual(response.headers["vary"], "Authorization")
+            self.assertIn(
+                "authorization",
+                {field.strip().lower() for field in response.headers["vary"].split(",")},
+            )
             payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
             self.assertEqual(payload["vc"]["id"], self.URL)
         self.assertEqual(canonical.headers["etag"], legacy.headers["etag"])
@@ -738,7 +741,10 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
                     response.headers["cache-control"], initial.headers["cache-control"]
                 )
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "Authorization")
+                self.assertIn(
+                    "authorization",
+                    {field.strip().lower() for field in response.headers["vary"].split(",")},
+                )
                 signer.assert_not_called()
 
     async def test_nonmatching_etags_return_signed_body(self):
