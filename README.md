@@ -65,6 +65,19 @@ pip install -r requirements.txt -r requirements-dev.txt
 | `SECRET_KEY` | JWT 서명 키. 32바이트 이상 |
 | `ISSUER_PRIVATE_KEY` | 발급자 Ed25519 개인키(base64 raw 32바이트). **팀에서 공유하는 값**을 써야 합니다 — `.env.example` 주석 참고. 보관·회전 정책은 ADR-0015(`agetrust-docs`) |
 
+`DEV_MODE=false`로 실제 OTP 문자를 보낼 때는 다음 SOLAPI 설정도 필요합니다.
+
+| 변수 | 설명 |
+|---|---|
+| `SOLAPI_API_KEY` | SOLAPI 콘솔에서 발급한 API Key |
+| `SOLAPI_API_SECRET` | API Key와 함께 발급된 Secret. 저장소나 채팅에 공유하지 않습니다 |
+| `SOLAPI_SENDER` | SOLAPI에서 등록을 마친 발신번호. 하이픈 없이 숫자만 입력합니다 |
+| `OTP_RESEND_COOLDOWN_SECONDS` | 동일 번호 재전송 대기시간. 기본값은 프로젝트 정책에 따른 30초입니다 |
+| `OTP_MAX_RESENDS` | 하나의 유효한 인증 요청에서 허용할 재발송 횟수. 기본값 5회입니다 |
+| `OTP_REQUEST_LIMIT_PER_CLIENT` / `OTP_REQUEST_LIMIT_WINDOW_SECONDS` | 접속 IP별 실제 발송 한도와 시간 창. 기본값은 10분에 10건입니다 |
+| `OTP_REQUEST_LIMIT_PER_RECIPIENT` / `OTP_REQUEST_RECIPIENT_WINDOW_SECONDS` | 수신번호별 장기 발송 한도와 시간 창. 기본값은 1시간에 6건입니다 |
+| `OTP_REQUEST_GLOBAL_LIMIT` / `OTP_REQUEST_GLOBAL_WINDOW_SECONDS` | 서버 프로세스 전체의 실제 발송 한도와 시간 창. 기본값은 1시간에 100건입니다 |
+
 나머지(Kafka 주소, 토픽, OTP·토큰 만료 시간 등)는 `app/config.py`에 기본값이 있어 그대로 두어도 됩니다.
 
 `.env`에 적은 값은 docker compose가 `env_file`로 컨테이너에 전부 넘깁니다. 설정을 추가할 때 `docker-compose.yml`을 같이 고칠 필요가 없습니다. 예외는 `DATABASE_URL`로, 컨테이너 안에서는 compose가 `POSTGRES_*`로 다시 조립합니다. 앱은 기동 시 기본값으로 떨어진 설정을 WARNING 로그로 남기므로, 값을 적었는데 반영이 안 되면 그 로그부터 보세요.
@@ -73,6 +86,59 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 `ISSUER_PRIVATE_KEY`를 바꾸면 발급자 DID(`ISSUER_DID`)도 함께 바뀝니다. 값은 프로세스가 뜰 때
 한 번만 읽으므로 교체에는 재기동이 필요하고, 무중단 회전은 되지 않습니다. 절차는 ADR-0015를 따릅니다.
+
+### 실제 OTP 문자 발송
+
+SOLAPI 콘솔에서 API Key를 만든 뒤 `.env`에 위 세 값을 채우고
+`DEV_MODE=false`로 설정합니다. 서버를 다시 기동한 다음 대한민국 휴대전화
+번호를 E.164 형식으로 요청합니다.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/phone/request \
+  -H "Content-Type: application/json" \
+  -d '{"phone_number":"+821012345678"}'
+```
+
+서버는 `+8210XXXXXXXX`를 SOLAPI의 국내 형식인 `010XXXXXXXX`로 변환해
+등록된 발신번호로 SMS를 접수합니다. 실제 발송 모드의 응답에서 `dev_otp`는
+항상 `null`이며, 수신한 인증번호를 `/api/v1/auth/phone/verify`에 전달합니다.
+이 API의 성공은 SOLAPI가 발송 요청을 접수했다는 뜻이며 단말의 최종 수신
+결과는 SOLAPI 메시지 상태에서 별도로 확인합니다.
+
+동일 번호로 30초 안에 다시 요청하면 `429 OTP_RESEND_TOO_SOON`과
+`Retry-After` 헤더를 반환합니다. 승인된 재전송은 **새로운 `verification_id`**와
+OTP를 발급하고 이전 미검증 요청을 만료시킵니다. 앱은 성공 응답을 받았을 때
+새 ID를 저장하고 이후 검증·가입에 사용해야 합니다. 기존 실패·재발송 횟수는
+새 요청으로 이어받아 초기화하지 않습니다. 실패 시도를 모두 쓴 뒤 발송을 요청하면
+`429 OTP_LOCKED_UNTIL_EXPIRY`와 해당 인증 요청의 만료까지 남은 시간을 나타내는
+`Retry-After` 헤더를 반환합니다. 재발송 한도에 도달한 요청은 만료될 때까지
+`429 OTP_RESEND_LIMIT_REACHED`로 거절합니다.
+
+검증 API(`/api/v1/auth/phone/verify`)는 실패 시도를 모두 쓴 요청에
+`401 OTP_MAX_ATTEMPTS`를 반환합니다. 생성되는 OTP는 기존과 같이 6자리 숫자이며,
+유효한 인증 요청에 64자 이하의 잘못된 OTP 문자열을 보내면 `401 OTP_MISMATCH`로
+처리하고 실패 횟수에 포함합니다. 64자를 넘기거나 문자열이 아닌 본문은 스키마 검증에서
+거절합니다.
+
+`429`로 재전송이 거절됐을 때는 기존 인증 입력 상태를 유지합니다. 타임아웃이나
+`502`로 응답이 불명확하면 서버에서 새 요청이 만들어졌을 수 있으므로, 대기 후
+재요청해 성공 응답의 ID와 새 SMS를 함께 사용합니다.
+
+실제 문자 발송에는 접속 IP별·수신번호별·서버 전체 발송량 제한도 적용하며, 초과 시
+`429 OTP_REQUEST_RATE_LIMITED`와 `Retry-After`를 반환합니다. 현재 배포 방식인
+단일 FastAPI 프로세스에 맞춰 메모리에서 집계하므로, 프로세스나 서버를 여러
+개로 늘릴 때는 API 게이트웨이 또는 Redis 같은 공유 저장소로 같은 제한을
+옮겨야 합니다. DB 저장 실패나 SOLAPI의 확정 미접수는 수신번호·전체 발송량
+예약에서 빼지만, 반복 호출을 막기 위한 접속 IP 요청 한도에는 포함합니다.
+타임아웃처럼 접수 결과를 알 수 없는 요청은 중복 발송과 비용 초과를 막기 위해
+시간 창이 끝날 때까지 예약을 유지합니다. SOLAPI 설정이 없으면
+`503 SMS_SERVICE_UNAVAILABLE`, SOLAPI가 접수하지 못하면
+`502 SMS_DELIVERY_FAILED`를 반환합니다.
+
+접속 IP는 `request.client.host`를 사용하며 현재 배포는 직접 접속을 전제로 합니다.
+리버스 프록시를 추가할 때는 신뢰할 프록시의 전달 헤더와 원래 클라이언트 IP가
+올바르게 반영되도록 서버를 설정해야 합니다. 클라이언트가 임의로 보낸
+`X-Forwarded-For`를 신뢰해서는 안 됩니다.
 
 ## 3. 인프라와 마이그레이션
 
@@ -115,8 +181,22 @@ ruff 버전은 `requirements-dev.txt`와 워크플로 양쪽에 고정돼 있습
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-E2E 3건(`tests/test_e2e_scenarios.py`)과 상태 목록 PostgreSQL 회귀 테스트 4건
-(`tests/test_status_list_db.py`)은 `E2E_DATABASE_URL`이 있을 때만 실행되고, 없으면 스킵됩니다. 켜려면:
+다음 통합 테스트는 `E2E_DATABASE_URL`이 있을 때만 실행되고, 없으면 스킵됩니다.
+
+| 검증 범위 | 테스트 파일 |
+|---|---|
+| 백엔드 성인 인증 E2E | `tests/test_e2e_scenarios.py` |
+| 상태 목록 PostgreSQL 회귀 | `tests/test_status_list_db.py` |
+| SMS 실패 시 인증 요청 정리 | `tests/test_sms_cas_e2e.py` |
+| 실제 SOLAPI SDK와 로컬 모의 SMS 서버 연동 | `tests/test_sms_http_e2e.py` |
+| OTP 재발송·실패 횟수·가입 검증 격리 | `tests/test_otp_isolation_e2e.py` |
+| 키오스크 관리자 키 발급·회전·폐기 | `tests/test_kiosk_admin_db.py` |
+| 키오스크 미사용 키 정리 | `tests/test_kiosk_key_cleanup_db.py` |
+| 키오스크 키 정리·관리자 폐기 간 잠금 경합 | `tests/test_kiosk_key_concurrency_db.py` |
+| 기존·탈퇴 계정 및 동시 가입의 전화번호 충돌 | `tests/test_signup_conflicts_db.py` |
+
+SMS HTTP 테스트는 실제 문자를 발송하지 않습니다. SMS HTTP와 OTP 격리 테스트는
+테스트별 스키마를 만들므로 테스트 계정에 `CREATE SCHEMA` 권한이 필요합니다. 켜려면:
 
 ```bash
 # macOS / Linux

@@ -7,10 +7,12 @@ devices 관련 엔드포인트는 팀 endpoints 목록(auth/vc/verify/stores)에
 
 import base64
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Request, status
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +21,10 @@ from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
+from app.core.otp_rate_limit import (
+    OtpSmsRateLimiter,
+    OtpSmsReservationDenied,
+)
 from app.core.revocation import revoke_active_credentials_for_device
 from app.core.security import (
     TokenError,
@@ -30,6 +36,12 @@ from app.core.security import (
     hash_password,
     verify_otp,
     verify_password_or_dummy,
+)
+from app.core.sms import (
+    SmsConfigurationError,
+    SmsDeliveryError,
+    send_otp_sms,
+    validate_sms_configuration,
 )
 from app.database import get_db
 from app.models import Device, PhoneVerificationRequest, User
@@ -53,11 +65,98 @@ from app.schemas.user import (
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
+otp_sms_rate_limiter = OtpSmsRateLimiter(
+    per_client_limit=settings.otp_request_limit_per_client,
+    per_client_window_seconds=settings.otp_request_limit_window_seconds,
+    per_recipient_limit=settings.otp_request_limit_per_recipient,
+    per_recipient_window_seconds=settings.otp_request_recipient_window_seconds,
+    global_limit=settings.otp_request_global_limit,
+    global_window_seconds=settings.otp_request_global_window_seconds,
+)
 
 
-def _fail(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
+def _fail(
+    code: AuthError,
+    status_code: int = status.HTTP_401_UNAUTHORIZED,
+    *,
+    headers: dict[str, str] | None = None,
+):
     """인증 실패가 기본이라 401을 기본값으로 둔다. 본문 형태는 공용 생성기가 정한다."""
-    return api_error(code, status_code)
+    return api_error(code, status_code, headers=headers)
+
+
+async def _find_active_phone_verification(
+    db: AsyncSession,
+    *,
+    phone_number: str,
+) -> tuple[PhoneVerificationRequest | None, datetime]:
+    """같은 번호의 OTP 발급을 직렬화하고 아직 유효한 요청을 찾는다."""
+    # 행이 아직 없는 최초 요청끼리도 동시에 문자를 보내지 못하도록 번호별
+    # transaction advisory lock을 먼저 잡는다. 잠금은 commit/rollback 때 풀린다.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:phone_number, 0))"),
+        {"phone_number": phone_number},
+    )
+    # 잠금 대기 시간을 만료·쿨다운 시간에 포함하지 않는다.
+    now = datetime.now(timezone.utc)
+    row = await db.scalar(
+        select(PhoneVerificationRequest)
+        .where(
+            PhoneVerificationRequest.phone_number == phone_number,
+            PhoneVerificationRequest.purpose == "SIGN_UP",
+            PhoneVerificationRequest.verified_at.is_(None),
+            PhoneVerificationRequest.consumed_at.is_(None),
+            PhoneVerificationRequest.expires_at > now,
+        )
+        .order_by(PhoneVerificationRequest.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    return row, now
+
+
+def _retry_after_until(expires_at: datetime, now: datetime) -> int:
+    """활성 요청이 끝날 때까지 남은 초를 Retry-After 형식으로 반환한다."""
+    return max(1, math.ceil((expires_at - now).total_seconds()))
+
+
+async def _invalidate_failed_sms_request(
+    db: AsyncSession,
+    *,
+    verification_id: UUID,
+    prepared_digest: str,
+    prepared_last_sent_at: datetime,
+) -> None:
+    """공급자가 거절한 OTP를 더 이상 검증할 수 없게 만든다.
+
+    OTP 준비 트랜잭션은 외부 호출 전에 이미 커밋된다. 따라서 공급자 실패는
+    별도의 짧은 트랜잭션으로 만료 처리한다. 이 정리 자체가 실패해도 원래의
+    공급자 오류를 가리지 않는다.
+    """
+    try:
+        result = await db.execute(
+            update(PhoneVerificationRequest)
+            .where(
+                PhoneVerificationRequest.id == verification_id,
+                PhoneVerificationRequest.otp_digest == prepared_digest,
+                PhoneVerificationRequest.last_sent_at == prepared_last_sent_at,
+                PhoneVerificationRequest.verified_at.is_(None),
+                PhoneVerificationRequest.consumed_at.is_(None),
+            )
+            .values(
+                expires_at=datetime.now(timezone.utc) - timedelta(microseconds=1)
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        if result.rowcount == 0:
+            logger.info(
+                "Skipped stale SMS failure cleanup for verification_id=%s",
+                verification_id,
+            )
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to invalidate an OTP after SMS delivery failure")
 
 
 # users의 UNIQUE 제약 이름 -> 클라이언트가 분기할 오류 코드.
@@ -145,32 +244,180 @@ async def _record_phone_verification_failure(
     "/phone/request",
     response_model=PhoneRequestResponse,
     summary="전화번호 인증번호 발송",
+    responses={
+        429: {
+            "model": AuthErrorResponse,
+            "description": (
+                "재전송 대기·횟수 또는 발송량 제한. 검증 시도 소진으로 발급이 "
+                "잠긴 경우 OTP_LOCKED_UNTIL_EXPIRY와 만료까지의 Retry-After 반환"
+            ),
+            "headers": {
+                "Retry-After": {
+                    "description": "다시 요청할 수 있을 때까지 남은 초",
+                    "schema": {"type": "integer"},
+                }
+            },
+        },
+        502: {
+            "model": AuthErrorResponse,
+            "description": "SOLAPI가 SMS를 접수하지 못함",
+        },
+        503: {
+            "model": AuthErrorResponse,
+            "description": "서버에 SOLAPI 설정이 준비되지 않음",
+        },
+    },
 )
-async def request_phone_otp(body: PhoneRequestBody, db: AsyncSession = Depends(get_db)):
+async def request_phone_otp(
+    body: PhoneRequestBody,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """전화번호로 인증번호를 발송하고 인증 요청 건을 생성한다.
 
-    응답의 verification_id는 이후 phone/verify와 signup 요청에 그대로 전달한다.
+    발급마다 새로운 verification_id를 반환한다. 재발급에 성공하면 이전의
+    미검증 요청은 만료되며, 새 ID를 이후 phone/verify와 signup에 전달한다.
     인증번호는 expires_at까지만 유효하며, 이후에는 재요청이 필요하다.
     """
-    otp = generate_otp()
-    from datetime import timedelta
-    now = datetime.now(timezone.utc)
-    row = PhoneVerificationRequest(
+    if not settings.dev_mode:
+        try:
+            validate_sms_configuration()
+        except SmsConfigurationError:
+            logger.error("SOLAPI configuration is missing or invalid")
+            raise _fail(
+                AuthError.SMS_SERVICE_UNAVAILABLE,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+    row, now = await _find_active_phone_verification(
+        db,
         phone_number=body.phone_number,
-        otp_digest="",  # 아래서 id 확보 후 채움
-        expires_at=now + timedelta(minutes=settings.otp_expire_minutes),
     )
-    db.add(row)
-    await db.flush()  # row.id(UUID)를 얻기 위해 flush
 
-    row.otp_digest = hash_otp(otp, str(row.id))
-    await db.commit()
+    if row is not None:
+        if row.attempt_count >= settings.otp_max_attempts:
+            raise _fail(
+                AuthError.OTP_LOCKED_UNTIL_EXPIRY,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(_retry_after_until(row.expires_at, now))},
+            )
+        if row.resend_count >= settings.otp_max_resends:
+            raise _fail(
+                AuthError.OTP_RESEND_LIMIT_REACHED,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(_retry_after_until(row.expires_at, now))},
+            )
+        elapsed = (now - row.last_sent_at).total_seconds()
+        retry_after = math.ceil(settings.otp_resend_cooldown_seconds - elapsed)
+        if retry_after > 0:
+            raise _fail(
+                AuthError.OTP_RESEND_TOO_SOON,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(retry_after)},
+            )
 
-    if settings.dev_mode:
-        print(f"[SMS 시뮬레이터] {body.phone_number} 로 인증번호 발송: {otp}")
+    reservation_token = None
+    if not settings.dev_mode:
+        client_id = request.client.host if request.client is not None else "unknown"
+        reservation = await otp_sms_rate_limiter.reserve(
+            client_id,
+            body.phone_number,
+        )
+        if isinstance(reservation, OtpSmsReservationDenied):
+            raise _fail(
+                AuthError.OTP_REQUEST_RATE_LIMITED,
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(reservation.retry_after_seconds)},
+            )
+        reservation_token = reservation.token
+
+    try:
+        attempt_count = row.attempt_count if row is not None else 0
+        resend_count = row.resend_count + 1 if row is not None else 0
+        if row is not None:
+            # ID는 검증 후 회원가입에 쓰이는 비밀 식별자다. 전화번호만 아는
+            # 새 요청자에게 기존 ID를 반환하면 인증 완료 상태가 공유된다.
+            # 기존 요청을 만료시키되 번호별 실패·재발급 횟수는 이어받는다.
+            # 위 row lock은 verify의 row lock과도 직렬화된다.
+            row.expires_at = now
+        row = PhoneVerificationRequest(
+            phone_number=body.phone_number,
+            otp_digest="",  # 아래서 id 확보 후 채움
+            attempt_count=attempt_count,
+            resend_count=resend_count,
+            last_sent_at=now,
+            expires_at=now + timedelta(minutes=settings.otp_expire_minutes),
+        )
+        db.add(row)
+        await db.flush()  # 새 row.id(UUID)를 얻기 위해 flush
+
+        otp = generate_otp()
+        row.otp_digest = hash_otp(otp, str(row.id))
+        verification_id = row.id
+        prepared_digest = row.otp_digest
+        prepared_last_sent_at = row.last_sent_at
+        expires_at = row.expires_at
+
+        # 먼저 OTP 상태를 확정해 문자만 도착하고 검증할 DB 상태는 없는 상황을
+        # 막는다. 이 커밋으로 번호별 advisory/row lock과 DB connection도 외부
+        # 네트워크 호출 전에 풀린다.
+        await db.commit()
+    except BaseException:
+        if reservation_token is not None:
+            await otp_sms_rate_limiter.release(
+                reservation_token,
+                retain_client_attempt=True,
+            )
+        raise
+
+    if not settings.dev_mode:
+        try:
+            receipt = await send_otp_sms(body.phone_number, otp)
+        except SmsConfigurationError:
+            await otp_sms_rate_limiter.release(
+                reservation_token,
+                retain_client_attempt=True,
+            )
+            await _invalidate_failed_sms_request(
+                db,
+                verification_id=verification_id,
+                prepared_digest=prepared_digest,
+                prepared_last_sent_at=prepared_last_sent_at,
+            )
+            logger.error("SOLAPI configuration is missing or invalid")
+            raise _fail(
+                AuthError.SMS_SERVICE_UNAVAILABLE,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except SmsDeliveryError as exc:
+            if not exc.may_have_been_sent:
+                await otp_sms_rate_limiter.release(
+                    reservation_token,
+                    retain_client_attempt=True,
+                )
+                await _invalidate_failed_sms_request(
+                    db,
+                    verification_id=verification_id,
+                    prepared_digest=prepared_digest,
+                    prepared_last_sent_at=prepared_last_sent_at,
+                )
+            logger.warning(
+                "SOLAPI OTP SMS failed for %s (code=%s, outcome_unknown=%s)",
+                mask_phone(body.phone_number),
+                exc.provider_code,
+                exc.may_have_been_sent,
+            )
+            raise _fail(AuthError.SMS_DELIVERY_FAILED, status.HTTP_502_BAD_GATEWAY)
+        await otp_sms_rate_limiter.confirm(reservation_token)
+        logger.info(
+            "SOLAPI accepted OTP SMS for %s (group_id=%s, message_id=%s)",
+            mask_phone(body.phone_number),
+            receipt.group_id,
+            receipt.message_id,
+        )
 
     return PhoneRequestResponse(
-        verification_id=str(row.id), expires_at=row.expires_at,
+        verification_id=str(verification_id), expires_at=expires_at,
         dev_otp=otp if settings.dev_mode else None,
     )
 
@@ -290,7 +537,10 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
     이 시점에 소모되어 재사용할 수 없다.
     전화번호는 인증 건에서 가져오므로 요청 본문에 포함하지 않는다.
     """
-    verification = await db.get(PhoneVerificationRequest, body.verification_id)
+    # 동시에 도착한 가입 요청도 같은 인증 건을 한 번만 소모해야 한다.
+    verification = await db.get(
+        PhoneVerificationRequest, body.verification_id, with_for_update=True,
+    )
     if verification is None:
         raise _fail(AuthError.OTP_NOT_FOUND, status.HTTP_404_NOT_FOUND)
     if verification.verified_at is None:
