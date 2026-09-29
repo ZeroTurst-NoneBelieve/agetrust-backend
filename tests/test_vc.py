@@ -555,7 +555,9 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             created_at=datetime.now(timezone.utc),
             expires_at=None,
             revoked_at=None,
-            last_used_at=None,
+            # 서명/ETag 테스트는 이미 사용 중인 키로 인증한다. 최초 사용
+            # UPDATE와 경쟁 상태는 키 인증 전용 PostgreSQL 테스트에서 다룬다.
+            last_used_at=datetime.now(timezone.utc),
         )
         request_headers = httpx.Headers(headers)
         request_headers["Authorization"] = f"Bearer {raw_key}"

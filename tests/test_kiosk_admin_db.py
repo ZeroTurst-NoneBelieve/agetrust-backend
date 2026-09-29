@@ -12,6 +12,7 @@ import re
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import httpx
 from sqlalchemy import select
@@ -24,6 +25,7 @@ os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
 from app.core.security import create_access_token  # noqa: E402
+from app.api.v1.endpoints import kiosk_admin  # noqa: E402
 from app.core.status_list import empty_encoded_list  # noqa: E402
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -110,6 +112,169 @@ class KioskAdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def _status(self, raw_key):
         return await self.client.get(self.status_path, headers={"Authorization": f"Bearer {raw_key}"})
+
+    async def _register(self):
+        response = await self.client.post(
+            "/api/v1/admin/kiosks", json={"store_id": self.store_id}, headers=self.admin_headers
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    async def _revoke(self, identifier):
+        return await self.client.post(
+            f"/api/v1/admin/kiosks/{identifier}/revoke", headers=self.admin_headers
+        )
+
+    async def _events(self, kiosk_id):
+        async with self.session_factory() as db:
+            audits = (await db.scalars(
+                select(AuditLog).where(AuditLog.source_kiosk_id == kiosk_id).order_by(AuditLog.id)
+            )).all()
+            outbox = (await db.scalars(
+                select(OutboxEvent).where(OutboxEvent.event_id.in_([row.event_id for row in audits]))
+            )).all()
+            return audits, outbox
+
+    async def test_device_revocation_covers_all_active_keys_and_is_idempotent(self):
+        first = await self._register()
+        other = await self._register()
+        identifier = first["kiosk_identifier"]
+        keys = [first["key"]]
+        for _ in range(4):
+            response = await self.client.post(
+                f"/api/v1/admin/kiosks/{identifier}/keys", json={}, headers=self.admin_headers
+            )
+            self.assertEqual(response.status_code, 201)
+            keys.append(response.json())
+        old = datetime.now(timezone.utc) - timedelta(days=2)
+        async with self.session_factory() as db:
+            rows = [await db.get(KioskApiKey, key["key_id"]) for key in keys]
+            rows[0].last_used_at = old
+            rows[1].created_at = old  # 24시간 미사용 키
+            rows[2].key_prefix = "legacy__"
+            rows[3].expires_at = old
+            rows[4].status, rows[4].revoked_at = "REVOKED", old
+            kiosk_id = rows[0].kiosk_id
+            await db.commit()
+        before, _ = await self._events(kiosk_id)
+
+        response = await self._revoke(identifier)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        async with self.session_factory() as db:
+            kiosk = await db.get(Kiosk, kiosk_id)
+            rows = [await db.get(KioskApiKey, key["key_id"]) for key in keys]
+            self.assertTrue(all(row.status == "REVOKED" for row in rows))
+            self.assertTrue(all(row.revoked_at == kiosk.revoked_at for row in rows[:4]))
+            self.assertEqual(rows[4].revoked_at, old)
+            other_key = await db.get(KioskApiKey, other["key"]["key_id"])
+            self.assertEqual(other_key.status, "ACTIVE")
+            revoked_at, updated_at = kiosk.revoked_at, kiosk.updated_at
+        after, outbox = await self._events(kiosk_id)
+        events = after[len(before):]
+        self.assertEqual([row.event_type for row in events], ["KIOSK_REVOKED"] + ["KIOSK_KEY_REVOKED"] * 4)
+        self.assertEqual({row.payload["key_id"] for row in events[1:]}, {key["key_id"] for key in keys[:4]})
+        self.assertTrue(all(row.payload["reason"] == "KIOSK_REVOKED" for row in events[1:]))
+        self.assertEqual({row.event_id for row in after}, {row.event_id for row in outbox})
+        for key in keys:
+            payloads = repr([row.payload for row in (*after, *outbox)])
+            self.assertNotIn(key["api_key"], payloads)
+            self.assertNotIn(hashlib.sha256(key["api_key"].encode()).hexdigest(), payloads)
+
+        self.assertEqual((await self._revoke(identifier)).status_code, 200)
+        repeated, _ = await self._events(kiosk_id)
+        self.assertEqual([row.event_id for row in repeated], [row.event_id for row in after])
+        async with self.session_factory() as db:
+            kiosk = await db.get(Kiosk, kiosk_id)
+            self.assertEqual((kiosk.revoked_at, kiosk.updated_at), (revoked_at, updated_at))
+        listed = await self.client.get(
+            f"/api/v1/admin/kiosks/{identifier}/keys", headers=self.admin_headers
+        )
+        self.assertTrue(all(key["status"] == "REVOKED" for key in listed.json()))
+        self.assertEqual((await self._status(keys[0]["api_key"])).json()["detail"]["code"], "KIOSK_KEY_INVALID")
+
+    async def test_repeated_device_revocation_repairs_legacy_residual_keys(self):
+        first = await self._register()
+        old = datetime.now(timezone.utc) - timedelta(days=1)
+        async with self.session_factory() as db:
+            key = await db.get(KioskApiKey, first["key"]["key_id"])
+            kiosk = await db.get(Kiosk, key.kiosk_id)
+            kiosk.status, kiosk.revoked_at, kiosk.updated_at = "REVOKED", old, old
+            kiosk_id = kiosk.id
+            await db.commit()
+        before, _ = await self._events(kiosk_id)
+        response = await self._revoke(first["kiosk_identifier"])
+        self.assertEqual(response.status_code, 200)
+        async with self.session_factory() as db:
+            key = await db.get(KioskApiKey, first["key"]["key_id"])
+            kiosk = await db.get(Kiosk, kiosk_id)
+            self.assertEqual(key.status, "REVOKED")
+            self.assertEqual((kiosk.revoked_at, kiosk.updated_at), (old, old))
+        after, _ = await self._events(kiosk_id)
+        self.assertEqual([row.event_type for row in after[len(before):]], ["KIOSK_KEY_REVOKED"])
+
+    async def test_audit_failure_rolls_back_device_keys_and_events(self):
+        first = await self._register()
+        async with self.session_factory() as db:
+            key = await db.get(KioskApiKey, first["key"]["key_id"])
+            kiosk_id = key.kiosk_id
+        before, _ = await self._events(kiosk_id)
+        original_audit = kiosk_admin.record_audit_event
+
+        async def fail_after_event_flush(db, **kwargs):
+            await original_audit(db, **kwargs)
+            # 키와 단말 UPDATE에 이어 감사/Outbox INSERT까지 수행한 뒤 실패한다.
+            await db.flush()
+            raise RuntimeError("injected audit failure")
+
+        with patch.object(kiosk_admin, "record_audit_event", fail_after_event_flush):
+            with self.assertRaisesRegex(RuntimeError, "injected audit failure"):
+                await self._revoke(first["kiosk_identifier"])
+        async with self.session_factory() as db:
+            kiosk = await db.get(Kiosk, kiosk_id)
+            key = await db.get(KioskApiKey, first["key"]["key_id"])
+            self.assertEqual((kiosk.status, key.status), ("ACTIVE", "ACTIVE"))
+            self.assertIsNone(kiosk.revoked_at)
+            self.assertIsNone(key.revoked_at)
+        after, outbox = await self._events(kiosk_id)
+        self.assertEqual([row.event_id for row in before], [row.event_id for row in after])
+        self.assertEqual({row.event_id for row in after}, {row.event_id for row in outbox})
+
+    async def test_usage_is_recorded_on_first_use_then_at_minute_intervals(self):
+        first = await self._register()
+        key_id, raw = first["key"]["key_id"], first["key"]["api_key"]
+        self.assertEqual((await self._status(raw)).status_code, 200)
+        async with self.session_factory() as db:
+            first_used = (await db.get(KioskApiKey, key_id)).last_used_at
+        self.assertIsNotNone(first_used)
+        self.assertEqual((await self._status(raw)).status_code, 200)
+        async with self.session_factory() as db:
+            key = await db.get(KioskApiKey, key_id)
+            self.assertEqual(key.last_used_at, first_used)
+            key.last_used_at = first_used - timedelta(minutes=2)
+            key.created_at = first_used - timedelta(days=2)
+            await db.commit()
+        self.assertEqual((await self._status(raw)).status_code, 200)
+        async with self.session_factory() as db:
+            self.assertGreater((await db.get(KioskApiKey, key_id)).last_used_at, first_used)
+
+    async def test_expired_unused_key_is_revoked_once_and_legacy_key_remains_usable(self):
+        first = await self._register()
+        legacy = await self._register()
+        async with self.session_factory() as db:
+            first_key = await db.get(KioskApiKey, first["key"]["key_id"])
+            legacy_key = await db.get(KioskApiKey, legacy["key"]["key_id"])
+            first_key.created_at = legacy_key.created_at = datetime.now(timezone.utc) - timedelta(days=2)
+            legacy_key.key_prefix = "legacy__"
+            kiosk_id = first_key.kiosk_id
+            await db.commit()
+        for _ in range(2):
+            response = await self._status(first["key"]["api_key"])
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json()["detail"]["code"], "KIOSK_KEY_INVALID")
+        self.assertEqual((await self._status(legacy["key"]["api_key"])).status_code, 200)
+        audits, _ = await self._events(kiosk_id)
+        self.assertEqual(sum(row.event_type == "KIOSK_KEY_AUTO_REVOKED" for row in audits), 1)
 
     async def test_admin_issuance_rotation_expiry_and_revocation(self):
         registered = await self.client.post(
@@ -205,7 +370,8 @@ class KioskAdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kiosk_revoked.json()["status"], "REVOKED")
         final_read = await self._status(third_key)
         self.assertEqual(final_read.status_code, 401)
-        self.assertEqual(final_read.json()["detail"]["code"], "KIOSK_INACTIVE")
+        # 단말과 함께 키 자체도 폐기되므로 키 우선 검사에서 거절한다.
+        self.assertEqual(final_read.json()["detail"]["code"], "KIOSK_KEY_INVALID")
 
         async with self.session_factory() as db:
             kiosk = (await db.execute(select(Kiosk).where(Kiosk.kiosk_identifier == identifier))).scalar_one()
