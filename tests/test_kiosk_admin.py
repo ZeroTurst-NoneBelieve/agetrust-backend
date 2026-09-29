@@ -62,7 +62,10 @@ class _Db:
         if entity is KioskApiKey:
             ints = [v for v in params.values() if isinstance(v, int)]
             if len(ints) == 1:
-                return _Result(None, [k for k in self.keys if k.kiosk_id == ints[0]])
+                rows = [k for k in self.keys if k.kiosk_id == ints[0]]
+                if "ACTIVE" in params.values():
+                    rows = [k for k in rows if k.status == "ACTIVE"]
+                return _Result(None, rows)
             key = next((k for k in self.keys if k.id in ints and k.kiosk_id in ints), None)
             return _Result(key)
         raise AssertionError(f"unexpected select: {entity}")

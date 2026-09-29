@@ -12,6 +12,8 @@ from app.core.kiosk_key_cleanup import run_unused_key_cleanup_loop
 from app.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
+PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS = 10
+KEY_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = 2
 
 
 @asynccontextmanager
@@ -32,20 +34,22 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         try:
-            await asyncio.wait_for(key_cleanup, timeout=10)
-        except asyncio.TimeoutError:
-            logger.warning("미사용 키 정리 종료가 지연되어 취소한다.")
-            key_cleanup.cancel()
-            await asyncio.gather(key_cleanup, return_exceptions=True)
-        if publisher is not None:
-            # 발행 중이던 배치가 커밋을 마칠 때까지 기다린다. 여기서 그냥
-            # cancel하면 이미 Kafka로 나간 이벤트의 published_at이 남지 않아
-            # 다음 기동 때 같은 이벤트를 다시 발행하게 된다.
+            if publisher is not None:
+                # 발행 중이던 배치가 커밋을 마칠 때까지 먼저 기다린다.
+                # 먼저 취소하면 이미 Kafka로 나간 이벤트의 published_at이
+                # 남지 않아 다음 기동 때 같은 이벤트를 다시 발행할 수 있다.
+                try:
+                    await asyncio.wait_for(publisher, timeout=PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    logger.warning("Publisher 종료가 지연되어 취소한다.")
+        finally:
+            # Publisher에서 예외가 나도 정리 태스크를 회수한다. 정리는 다음
+            # 기동에서 이어갈 수 있으므로 대기 시간을 짧게 둔다. wait_for가
+            # 타임아웃 시 취소와 회수까지 수행하므로 별도 cancel은 필요 없다.
             try:
-                await asyncio.wait_for(publisher, timeout=10)
+                await asyncio.wait_for(key_cleanup, timeout=KEY_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                logger.warning("Publisher 종료가 지연되어 취소한다.")
-                publisher.cancel()
+                logger.warning("미사용 키 정리 종료가 지연되어 취소한다.")
 
 
 app = FastAPI(

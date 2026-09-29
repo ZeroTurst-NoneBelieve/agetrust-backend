@@ -115,3 +115,103 @@ class KioskKeyCleanupTests(unittest.IsolatedAsyncioTestCase):
             async with app_main.lifespan(app_main.app):
                 await asyncio.wait_for(started.wait(), timeout=1)
             self.assertTrue(stopped.is_set())
+
+    async def test_cleanup_failure_does_not_skip_publisher_shutdown(self):
+        publisher_started = asyncio.Event()
+        publisher_committed = asyncio.Event()
+        cleanup_failed = asyncio.Event()
+
+        async def publisher(_factory, stop):
+            publisher_started.set()
+            await stop.wait()
+            await cleanup_failed.wait()
+            publisher_committed.set()
+
+        async def cleanup(_factory, stop):
+            await stop.wait()
+            cleanup_failed.set()
+            raise RuntimeError("cleanup failed")
+
+        with (
+            patch.object(app_main, "run_publisher_loop", publisher),
+            patch.object(app_main, "run_unused_key_cleanup_loop", cleanup),
+            patch.object(app_main.settings, "kafka_publisher_enabled", True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                async with app_main.lifespan(app_main.app):
+                    await asyncio.wait_for(publisher_started.wait(), timeout=1)
+        self.assertTrue(publisher_committed.is_set())
+
+    async def test_publisher_failure_still_waits_for_cleanup(self):
+        cleanup_finished = asyncio.Event()
+
+        async def publisher(_factory, stop):
+            await stop.wait()
+            raise RuntimeError("publisher failed")
+
+        async def cleanup(_factory, stop):
+            await stop.wait()
+            cleanup_finished.set()
+
+        with (
+            patch.object(app_main, "run_publisher_loop", publisher),
+            patch.object(app_main, "run_unused_key_cleanup_loop", cleanup),
+            patch.object(app_main.settings, "kafka_publisher_enabled", True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "publisher failed"):
+                async with app_main.lifespan(app_main.app):
+                    pass
+        self.assertTrue(cleanup_finished.is_set())
+
+    async def test_shutdown_timeouts_cancel_and_collect_both_tasks(self):
+        started = [asyncio.Event(), asyncio.Event()]
+        finished = [asyncio.Event(), asyncio.Event()]
+
+        async def blocked(index):
+            started[index].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finished[index].set()
+
+        with (
+            patch.object(app_main, "run_publisher_loop", lambda *_: blocked(0)),
+            patch.object(app_main, "run_unused_key_cleanup_loop", lambda *_: blocked(1)),
+            patch.object(app_main.settings, "kafka_publisher_enabled", True),
+            patch.object(app_main, "PUBLISHER_SHUTDOWN_TIMEOUT_SECONDS", 0.01),
+            patch.object(app_main, "KEY_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS", 0.01),
+            self.assertLogs("app.main", level="WARNING") as logs,
+        ):
+            async with app_main.lifespan(app_main.app):
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), timeout=1)
+        self.assertTrue(all(event.is_set() for event in finished))
+        self.assertEqual(len(logs.output), 2)
+
+    async def test_cleanup_timeout_does_not_consume_publisher_grace_period(self):
+        publisher_finished = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        cleanup_started = asyncio.Event()
+
+        async def publisher(_factory, stop):
+            await stop.wait()
+            self.assertFalse(cleanup_cancelled.is_set())
+            publisher_finished.set()
+
+        async def cleanup(_factory, _stop):
+            cleanup_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.assertTrue(publisher_finished.is_set())
+                cleanup_cancelled.set()
+
+        with (
+            patch.object(app_main, "run_publisher_loop", publisher),
+            patch.object(app_main, "run_unused_key_cleanup_loop", cleanup),
+            patch.object(app_main.settings, "kafka_publisher_enabled", True),
+            patch.object(app_main, "KEY_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS", 0.01),
+            self.assertLogs("app.main", level="WARNING"),
+        ):
+            async with app_main.lifespan(app_main.app):
+                await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        self.assertTrue(cleanup_cancelled.is_set())
