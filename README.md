@@ -192,7 +192,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 | OTP 재발송·실패 횟수·가입 검증 격리 | `tests/test_otp_isolation_e2e.py` |
 | 키오스크 관리자 키 발급·회전·폐기 | `tests/test_kiosk_admin_db.py` |
 | 키오스크 미사용 키 정리 | `tests/test_kiosk_key_cleanup_db.py` |
-| 키오스크 키 정리·관리자 폐기 간 잠금 경합 | `tests/test_kiosk_key_concurrency_db.py` |
+| 키오스크 인증·키 발급·자동 정리·관리자 폐기 간 잠금 경합 | `tests/test_kiosk_key_concurrency_db.py` |
 | 기존·탈퇴 계정 및 동시 가입의 전화번호 충돌 | `tests/test_signup_conflicts_db.py` |
 | 키오스크 검증 결과 인증·중복 처리·감사/Outbox 원자성 | `tests/test_kiosk_results_db.py` |
 
@@ -250,6 +250,25 @@ RETURNING id, platform_role;
    확인합니다. 필요하면 `PATCH /api/v1/admin/kiosks/{kiosk_identifier}/keys/{key_id}`에
    `{"expires_at": "<ISO 8601 미래 시각>"}`을 보내 구 키의 만료 시각을 정하고,
    `POST /api/v1/admin/kiosks/{kiosk_identifier}/keys/{key_id}/revoke`로 최종 폐기합니다.
+
+`last_used_at`은 최초 인증 때 즉시 저장하고, 이후에는 마지막 기록에서 1분 이상 지난
+인증에서 갱신합니다. 최근 기록이 있는 요청은 키 행에 쓰기 잠금을 잡지 않으며, 동시 요청은
+조건부 UPDATE로 중복 갱신을 줄입니다. 이 값은 최대 약 1분의 기록 간격을 가지므로 구 키의
+사용 중단을 판단할 때는 1분 이상의 관찰 구간과 현장 전환 상태를 함께 확인하세요.
+매 요청의 키·단말 상태와 만료 검사는 유지합니다.
+
+단말 자체를 폐기하려면 `POST /api/v1/admin/kiosks/{kiosk_identifier}/revoke`를 호출합니다.
+단말과 해당 단말의 모든 ACTIVE 키를 같은 트랜잭션에서 REVOKED로 바꾸고 감사/Outbox를
+기록합니다. 사용 이력·legacy 여부·만료 시각과 관계없이 ACTIVE 키 모두가 대상입니다.
+키별 감사 이벤트는 `KIOSK_KEY_REVOKED`, 사유는 `KIOSK_REVOKED`이며 키 ID만 포함합니다.
+기존에 폐기된 단말의 잔여 ACTIVE 키도 같은 API를 재호출해 정리할 수 있습니다.
+이미 폐기된 상태의 시각·이벤트는 중복 기록하지 않습니다. 단말 폐기 후 인증은 키 검사에서
+`401 KIOSK_KEY_INVALID`로 거절됩니다. 이 작업은 이미 인증을 통과한 요청을 소급 취소하지 않습니다.
+
+현재 API 종료 시에는 Publisher의 진행 중 배치 커밋을 최대 10초 먼저 기다리고,
+미사용 키 정리는 최대 2초 기다린 뒤 취소·회수합니다. 한 태스크의 예외가 다른 태스크의
+종료 처리를 건너뛰지 않게 합니다. PR #51의 Publisher 별도 프로세스 변경을 반영할 때는
+API의 미사용 키 정리 lifespan을 유지하고 Publisher 종료 책임만 별도 프로세스로 옮겨야 합니다.
 
 마이그레이션 전의 유일한 정상 키 해시는 `legacy__` 표식으로 보존되지만 원문은 복구할 수
 없습니다. 동일한 해시가 여러 키오스크에 있던 경우는 기존에도 인증이 거부됐으므로 옮기지

@@ -277,10 +277,40 @@ async def revoke_kiosk(
 ):
     response.headers["Cache-Control"] = "no-store"
     kiosk = await _find_kiosk(db, kiosk_identifier)
-    if kiosk.status != "REVOKED":
-        kiosk.status = "REVOKED"
-        kiosk.revoked_at = datetime.now(timezone.utc)
-        kiosk.updated_at = kiosk.revoked_at
-        await _audit(db, admin, "KIOSK_REVOKED", kiosk, {"store_id": kiosk.store_id})
-        await db.commit()
+    try:
+        # 자동 정리와 같은 순서(키 행 → 감사 체인)로 잠근다. 감사 기록부터
+        # 시작하면 키를 가진 정리 작업과 서로의 잠금을 기다리게 된다.
+        # 전체 폐기이므로 SKIP LOCKED로 아직 잠긴 키를 건너뛰지 않는다.
+        result = await db.execute(
+            select(KioskApiKey)
+            .where(KioskApiKey.kiosk_id == kiosk.id, KioskApiKey.status == "ACTIVE")
+            .order_by(KioskApiKey.id)
+            .with_for_update()
+        )
+        keys = result.scalars().all()
+        now = datetime.now(timezone.utc)
+        kiosk_changed = kiosk.status != "REVOKED"
+        if kiosk_changed:
+            kiosk.status = "REVOKED"
+            kiosk.revoked_at = now
+            kiosk.updated_at = now
+        for key in keys:
+            key.status = "REVOKED"
+            key.revoked_at = now
+
+        if kiosk_changed or keys:
+            await db.flush()
+            if kiosk_changed:
+                await _audit(db, admin, "KIOSK_REVOKED", kiosk, {"store_id": kiosk.store_id})
+            # 이미 폐기된 단말에 남은 ACTIVE 키도 재호출로 정리한다.
+            # 실제로 상태가 바뀐 키만 기존 개별 폐기 이벤트에 사유를 더한다.
+            for key in keys:
+                await _audit(
+                    db, admin, "KIOSK_KEY_REVOKED", kiosk,
+                    {"key_id": key.id, "reason": "KIOSK_REVOKED"},
+                )
+            await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return KioskResponse.model_validate(kiosk)

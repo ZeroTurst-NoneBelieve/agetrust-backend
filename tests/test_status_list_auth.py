@@ -12,6 +12,7 @@ import httpx
 import jwt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy.exc import MultipleResultsFound
+from sqlalchemy.sql.dml import Update
 
 _ISSUER_KEY_BYTES = bytes(range(32))
 os.environ["DATABASE_URL"] = "postgresql+asyncpg://test:test@localhost/test"
@@ -23,7 +24,24 @@ from app.core.status_list import empty_encoded_list  # noqa: E402
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import CredentialStatusList, Kiosk, KioskApiKey  # noqa: E402
-from tests.fakes import FakeDb  # noqa: E402
+from tests.fakes import FakeDb, FakeResult  # noqa: E402
+
+
+class _KeyDb(FakeDb):
+    """성공한 키 UPDATE의 상태만 반영한다. SQL 경합 조건은 PG 테스트가 검증한다."""
+
+    async def execute(self, statement, params=None):
+        if isinstance(statement, Update) and statement.table.name == "kiosk_api_keys":
+            self.executed.append(statement)
+            key = self.scalar_results[KioskApiKey]
+            values = statement.compile().params
+            if "revoked_at" in values:
+                key.status = values["status"]
+                key.revoked_at = values["revoked_at"]
+            else:
+                key.last_used_at = datetime.now(timezone.utc)
+            return FakeResult(scalar=key.id)
+        return await super().execute(statement, params)
 
 
 class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
@@ -55,7 +73,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             encoded_list=empty_encoded_list(),
             version=1,
         )
-        self.db = FakeDb(
+        self.db = _KeyDb(
             {(CredentialStatusList, 7): self.row, (Kiosk, self.kiosk.id): self.kiosk},
             scalar_results={KioskApiKey: self.key},
         )
@@ -293,8 +311,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(self.db, "execute", wraps=self.db.execute) as execute:
                     response = await self._get(path, self._key_headers())
                 self.assertEqual(response.status_code, 200)
-                execute.assert_awaited_once()
-                query = execute.await_args.args[0]
+                query = execute.await_args_list[0].args[0]
                 sql = str(query.compile(compile_kwargs={"literal_binds": True}))
                 where_clause = sql.split("WHERE", 1)[1]
                 digest = hashlib.sha256(self.RAW_KEY.encode()).hexdigest()
@@ -304,6 +321,7 @@ class StatusListAuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("kiosks.kiosk_identifier", where_clause)
                 self.assertNotIn(self.RAW_KEY, sql)
                 self.assertIn("LIMIT 2", where_clause)
+                self.assertNotIn("FOR UPDATE", sql)
 
     async def test_duplicate_key_hash_is_rejected_instead_of_selecting_one_kiosk(self):
         duplicate_result = SimpleNamespace(

@@ -6,12 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import api_error
 from app.core.audit import record_audit_event
+from app.core.kiosk_key_cleanup import UNUSED_KEY_GRACE_PERIOD
 from app.core.security import TokenError, decode_login_token
 from app.database import get_db
 from app.models import Kiosk, KioskApiKey, User
@@ -27,6 +28,9 @@ kiosk_key_scheme = HTTPBearer(
     ),
     auto_error=False,
 )
+
+# 회전 확인에 필요한 분 단위 사용 이력만 쓴다. 최초 사용은 즉시 기록한다.
+KIOSK_KEY_USAGE_INTERVAL = timedelta(minutes=1)
 
 
 def _deny(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
@@ -82,7 +86,6 @@ async def get_current_kiosk(
             KioskApiKey.key_prefix.in_((raw_key[:8], "legacy__")),
         )
         .limit(2)
-        .with_for_update()
     )
     try:
         key = result.scalar_one_or_none()
@@ -93,24 +96,93 @@ async def get_current_kiosk(
 
     if not secrets.compare_digest(key_hash.encode("ascii"), key.key_hash.encode("utf-8")):
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
+    key = await _check_kiosk_key(db, key)
+
+    kiosk = await db.get(Kiosk, key.kiosk_id)
+    if kiosk is None:
+        raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
+    if kiosk.status != "ACTIVE":
+        raise _deny_kiosk(AuthError.KIOSK_INACTIVE)
+
     now = datetime.now(timezone.utc)
+    if key.last_used_at is None or key.last_used_at <= now - KIOSK_KEY_USAGE_INTERVAL:
+        # 같은 오래된 시각을 읽은 요청이 겹쳐도 첫 요청만 갱신한다.
+        # UPDATE에서도 폐기·만료와 신규 키의 24시간 제한을 확인한다.
+        # clock_timestamp()로 트랜잭션 시작 시각에 고정되는 now()를 피한다.
+        touched = await db.execute(
+            update(KioskApiKey)
+            .where(
+                KioskApiKey.id == key.id,
+                KioskApiKey.status == "ACTIVE",
+                KioskApiKey.revoked_at.is_(None),
+                or_(KioskApiKey.expires_at.is_(None), KioskApiKey.expires_at > func.clock_timestamp()),
+                or_(
+                    KioskApiKey.key_prefix == "legacy__",
+                    KioskApiKey.last_used_at.is_not(None),
+                    KioskApiKey.created_at > func.clock_timestamp() - UNUSED_KEY_GRACE_PERIOD,
+                ),
+                or_(
+                    KioskApiKey.last_used_at.is_(None),
+                    KioskApiKey.last_used_at <= now - KIOSK_KEY_USAGE_INTERVAL,
+                ),
+            )
+            .values(last_used_at=func.greatest(KioskApiKey.last_used_at, func.clock_timestamp()))
+            .returning(KioskApiKey.id)
+            .execution_options(synchronize_session=False)
+        )
+        if touched.scalar_one_or_none() is None:
+            # 다른 인증이 먼저 기록했거나 폐기가 먼저 끝났을 수 있다.
+            # identity map의 오래된 값 대신 최신 상태로 다시 판단한다.
+            key = await db.get(KioskApiKey, key.id, populate_existing=True)
+            await _check_kiosk_key(db, key)
+
+    # 인증 의존성은 엔드포인트 본문보다 먼저 실행된다. 인증 트랜잭션을
+    # 끝내 결과 기록 등 이후 업무 변경과 사용 이력의 저장을 분리한다.
+    await db.commit()
+    return kiosk
+
+
+def _unused_key_expired(key: KioskApiKey, now: datetime) -> bool:
+    return (
+        key.key_prefix != "legacy__"
+        and key.last_used_at is None
+        and key.created_at <= now - UNUSED_KEY_GRACE_PERIOD
+    )
+
+
+def _validate_kiosk_key(key: KioskApiKey | None, now: datetime) -> None:
     if (
-        key.status != "ACTIVE"
+        key is None
+        or key.status != "ACTIVE"
         or key.revoked_at is not None
         or (key.expires_at is not None and key.expires_at <= now)
     ):
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
 
-    # 설치 중 유출된 신규 키가 장기간 남지 않도록, 한 번도 쓰이지 않은
-    # 발급 키는 24시간 뒤 폐기한다. 이전 스키마에서 옮긴 키는 사용 이력을
-    # 복원할 수 없으므로 별도 회전 대상으로 남긴다.
-    if (
-        key.key_prefix != "legacy__"
-        and key.last_used_at is None
-        and key.created_at <= now - timedelta(hours=24)
-    ):
-        key.status = "REVOKED"
-        key.revoked_at = now
+
+async def _check_kiosk_key(db: AsyncSession, key: KioskApiKey | None) -> KioskApiKey:
+    now = datetime.now(timezone.utc)
+    _validate_kiosk_key(key, now)
+    if not _unused_key_expired(key, now):
+        return key
+
+    # 최초 사용·관리자 폐기·정리 루프와 경합해도 상태를 덮어쓰지 않는다.
+    # 실제로 폐기한 요청만 감사/Outbox를 기록한다. legacy 키는 제외한다.
+    result = await db.execute(
+        update(KioskApiKey)
+        .where(
+            KioskApiKey.id == key.id,
+            KioskApiKey.status == "ACTIVE",
+            KioskApiKey.revoked_at.is_(None),
+            KioskApiKey.key_prefix != "legacy__",
+            KioskApiKey.last_used_at.is_(None),
+            KioskApiKey.created_at <= now - UNUSED_KEY_GRACE_PERIOD,
+        )
+        .values(status="REVOKED", revoked_at=now)
+        .returning(KioskApiKey.id)
+        .execution_options(synchronize_session=False)
+    )
+    if result.scalar_one_or_none() is not None:
         await record_audit_event(
             db,
             event_type="KIOSK_KEY_AUTO_REVOKED",
@@ -123,18 +195,12 @@ async def get_current_kiosk(
         await db.commit()
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
 
-    kiosk = await db.get(Kiosk, key.kiosk_id)
-    if kiosk is None:
+    key = await db.get(KioskApiKey, key.id, populate_existing=True)
+    now = datetime.now(timezone.utc)
+    _validate_kiosk_key(key, now)
+    if _unused_key_expired(key, now):
         raise _deny_kiosk(AuthError.KIOSK_KEY_INVALID)
-    if kiosk.status != "ACTIVE":
-        raise _deny_kiosk(AuthError.KIOSK_INACTIVE)
-
-    # 회전 후 구 키 사용이 멈췄는지 운영자가 확인할 수 있어야 한다.
-    # 인증 의존성은 엔드포인트 본문보다 먼저 실행되므로 여기서 커밋해도
-    # 이후 비즈니스 변경을 함께 저장하지 않는다.
-    key.last_used_at = now
-    await db.commit()
-    return kiosk
+    return key
 
 
 def _deny_kiosk(code: AuthError) -> HTTPException:
