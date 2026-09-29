@@ -48,6 +48,7 @@ from app.models import (  # noqa: E402
     CredentialStatusList,
     Device,
     Kiosk,
+    KioskApiKey,
     VcCredential,
 )
 from app.schemas.errors import VcError  # noqa: E402
@@ -539,12 +540,24 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     async def _http_get(db, path="/api/v1/status-lists/7", headers=None):
-        raw_key = "test-status-list-reader-key"
-        db.scalar_results[Kiosk] = SimpleNamespace(
+        raw_key = "ak_" + "C" * 43
+        db.rows[(Kiosk, 5)] = SimpleNamespace(
             id=5,
             kiosk_identifier="test-status-list-reader",
-            api_key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
             status="ACTIVE",
+        )
+        db.scalar_results[KioskApiKey] = SimpleNamespace(
+            id=6,
+            kiosk_id=5,
+            key_prefix=raw_key[:8],
+            key_hash=hashlib.sha256(raw_key.encode()).hexdigest(),
+            status="ACTIVE",
+            created_at=datetime.now(timezone.utc),
+            expires_at=None,
+            revoked_at=None,
+            # 서명/ETag 테스트는 이미 사용 중인 키로 인증한다. 최초 사용
+            # UPDATE와 경쟁 상태는 키 인증 전용 PostgreSQL 테스트에서 다룬다.
+            last_used_at=datetime.now(timezone.utc),
         )
         request_headers = httpx.Headers(headers)
         request_headers["Authorization"] = f"Bearer {raw_key}"
@@ -696,7 +709,10 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.headers["content-type"], "application/jwt")
             self.assertEqual(response.headers["cache-control"], "private, no-cache")
-            self.assertEqual(response.headers["vary"], "Authorization")
+            self.assertIn(
+                "authorization",
+                {field.strip().lower() for field in response.headers["vary"].split(",")},
+            )
             payload = jwt.decode(response.text, self._public_key(), algorithms=["EdDSA"])
             self.assertEqual(payload["vc"]["id"], self.URL)
         self.assertEqual(canonical.headers["etag"], legacy.headers["etag"])
@@ -727,7 +743,10 @@ class StatusListEndpointTests(unittest.IsolatedAsyncioTestCase):
                     response.headers["cache-control"], initial.headers["cache-control"]
                 )
                 self.assertEqual(response.headers["cache-control"], "private, no-cache")
-                self.assertEqual(response.headers["vary"], "Authorization")
+                self.assertIn(
+                    "authorization",
+                    {field.strip().lower() for field in response.headers["vary"].split(",")},
+                )
                 signer.assert_not_called()
 
     async def test_nonmatching_etags_return_signed_body(self):

@@ -5,6 +5,8 @@ import os
 import unittest
 from unittest import mock
 
+from pydantic import ValidationError
+
 from app.config import Settings, log_defaulted_settings
 
 REQUIRED = {
@@ -55,6 +57,7 @@ class DefaultedFieldsTest(unittest.TestCase):
         every = {name.upper(): "1" for name in Settings.model_fields}
         every.update(REQUIRED)
         every["DEV_MODE"] = "false"
+        every["OTP_LENGTH"] = "6"
         every["LOG_LEVEL"] = "INFO"
         s = _settings_with_env(every)
 
@@ -63,6 +66,10 @@ class DefaultedFieldsTest(unittest.TestCase):
             log_defaulted_settings(s)
 
         warning.assert_not_called()
+
+    def test_otp_length_must_match_the_six_digit_api_contract(self):
+        with self.assertRaises(ValidationError):
+            _settings_with_env({"OTP_LENGTH": "8"})
 
 
 if __name__ == "__main__":

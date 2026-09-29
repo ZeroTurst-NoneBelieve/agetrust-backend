@@ -5,6 +5,7 @@ from app.models.business_membership import BusinessMembership
 from app.models.credential_status_list import CredentialStatusList
 from app.models.device import Device
 from app.models.kiosk import Kiosk
+from app.models.kiosk_api_key import KioskApiKey
 from app.models.outbox_event import OutboxEvent
 from app.models.phone_verification_request import PhoneVerificationRequest
 from app.models.store import Store
@@ -21,6 +22,7 @@ __all__ = [
     "CredentialStatusList",
     "Device",
     "Kiosk",
+    "KioskApiKey",
     "OutboxEvent",
     "PhoneVerificationRequest",
     "Store",
