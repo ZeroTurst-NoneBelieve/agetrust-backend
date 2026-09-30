@@ -85,7 +85,7 @@ pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 
 나머지(Kafka 주소, 토픽, OTP·토큰 만료 시간 등)는 `app/config.py`에 기본값이 있어 그대로 두어도 됩니다.
 
-`.env`에 적은 값은 docker compose가 `env_file`로 컨테이너에 전부 넘깁니다. 설정을 추가할 때 `docker-compose.yml`을 같이 고칠 필요가 없습니다. 예외는 `DATABASE_URL`로, 컨테이너 안에서는 compose가 `POSTGRES_*`로 다시 조립합니다. 앱은 기동 시 기본값으로 떨어진 설정을 WARNING 로그로 남기므로, 값을 적었는데 반영이 안 되면 그 로그부터 보세요.
+`.env`에 적은 값은 docker compose가 `env_file`로 컨테이너에 전부 넘깁니다. 설정을 추가할 때 `docker-compose.yml`을 같이 고칠 필요가 없습니다. 예외는 컨테이너 안에서 값이 달라야 하는 두 가지입니다. `DATABASE_URL`은 compose가 `POSTGRES_*`로 다시 조립하고, `KAFKA_BOOTSTRAP_SERVERS`는 `kafka:29092`로 고정합니다. 그래서 호스트에서 워커를 띄우려고 `.env`에 `localhost:9092`를 적어도 컨테이너에는 영향이 없습니다. 앱은 기동 시 기본값으로 떨어진 설정을 INFO 로그(`app.config: 환경변수에 없어 코드 기본값을 쓰는 설정: ...`)로 남기므로, 값을 적었는데 반영이 안 되면 그 로그부터 보세요.
 
 `.env`는 커밋되지 않습니다. Public 레포이므로 실제 키를 다른 파일에 옮겨 적지 마세요.
 

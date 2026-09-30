@@ -42,18 +42,20 @@ class DefaultedFieldsTest(unittest.TestCase):
         self.assertIn("PUBLIC_BASE_URL", missing)
         self.assertIn("LOG_LEVEL", missing)
 
-    def test_warning_lists_defaulted_fields_in_one_line(self):
+    def test_info_lists_defaulted_fields_in_one_line(self):
         s = _settings_with_env({"DEV_MODE": "true"})
 
-        with self.assertLogs("app.config", level="WARNING") as cm:
+        with self.assertLogs("app.config", level="INFO") as cm:
             log_defaulted_settings(s)
 
         self.assertEqual(len(cm.records), 1)
+        # 정상 구성에서도 찍히는 진단 로그이므로 WARNING이면 안 된다 (#52).
+        self.assertEqual(cm.records[0].levelno, logging.INFO)
         message = cm.records[0].getMessage()
         self.assertIn("PUBLIC_BASE_URL", message)
         self.assertNotIn("DEV_MODE", message)
 
-    def test_no_warning_when_everything_is_provided(self):
+    def test_no_log_when_everything_is_provided(self):
         every = {name.upper(): "1" for name in Settings.model_fields}
         every.update(REQUIRED)
         every["DEV_MODE"] = "false"
@@ -61,11 +63,8 @@ class DefaultedFieldsTest(unittest.TestCase):
         every["LOG_LEVEL"] = "INFO"
         s = _settings_with_env(every)
 
-        logger = logging.getLogger("app.config")
-        with mock.patch.object(logger, "warning") as warning:
+        with self.assertNoLogs("app.config", level="INFO"):
             log_defaulted_settings(s)
-
-        warning.assert_not_called()
 
     def test_otp_length_must_match_the_six_digit_api_contract(self):
         with self.assertRaises(ValidationError):

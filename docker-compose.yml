@@ -7,7 +7,7 @@ x-app: &app
   # 나열했고, 빠뜨리면 .env에 적어도 조용히 무시되는 사고가 두 번 났다(#24 · #32).
   # 이미지에는 들어가지 않는다. compose가 기동 시점에 주입할 뿐이다.
   env_file: .env
-  # environment는 env_file보다 우선한다. 두 경우에만 쓴다.
+  # environment는 env_file보다 우선한다. 아래 세 경우에만 쓴다.
   environment:
     # 1) 컨테이너 안에서 값이 달라야 하는 것. .env의 DATABASE_URL은 호스트에서
     #    직접 실행할 때 쓰는 localhost 주소이므로 postgres 서비스명으로 덮어쓴다.
