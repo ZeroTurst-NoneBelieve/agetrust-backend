@@ -1,0 +1,60 @@
+# 전이 의존성까지 포함한 설치 버전 고정 (#62).
+#
+# requirements.txt는 "무엇이 필요한가"(하한)만 적고, 실제로 설치할 버전은
+# 이 파일이 정한다. 하한만 두면 CI·이미지 빌드가 그날의 최신판을 받아
+# 코드 변경 없이 깨진다 — 2026-09-28에 starlette 1.7(CORS가 Vary에 Origin
+# 추가)과 SQLAlchemy 2.1(greenlet 기본 설치 제외)이 그렇게 들어왔다.
+# starlette·greenlet은 간접 의존성이라 requirements.txt만 고정해서는 못 막는다.
+#
+# 설치: pip install -r requirements.txt -c constraints.txt
+#
+# 값의 출처: CI run 36377517087(2026-09-28, Python 3.11, 271건 통과)이
+# 실제로 설치한 버전. 올릴 때는 이 파일을 고치는 PR에서 CI를 통과시킨다.
+# 재생성: python:3.11-slim에서 위 명령 대신 `pip install -r requirements.txt`
+# 후 `pip freeze`. uvloop 등 리눅스 전용 패키지가 있으므로 윈도우에서 뽑지 않는다.
+aiokafka==0.14.0
+alembic==1.20.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+asyncpg==0.31.0
+async-timeout==5.0.1
+base58==2.1.1
+bcrypt==5.0.0
+certifi==2026.7.22
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.1
+ecdsa==0.19.2
+fastapi==0.141.1
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.20
+mako==1.4.3
+markupsafe==3.0.3
+packaging==26.3
+passlib==1.7.4
+psycopg2-binary==2.9.13
+pyasn1==0.6.4
+pycparser==3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pydantic-settings==2.15.0
+pyjwt==2.15.0
+python-dotenv==1.2.3
+python-jose==3.5.0
+pyyaml==6.0.3
+rsa==4.9.1
+six==1.17.0
+solapi==5.0.3
+sqlalchemy==2.1.1
+starlette==1.7.0
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+uvicorn==0.54.0
+uvloop==0.22.1
+watchfiles==1.3.0
+websockets==17.1

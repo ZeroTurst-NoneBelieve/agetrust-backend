@@ -29,6 +29,7 @@ agetrust-backend/
 ├── .github/workflows/ci.yml     # CI (Lint · 테스트 자동 실행)
 ├── pyproject.toml               # ruff 린트 규칙 설정
 ├── requirements.txt             # 파이썬 의존성 패키지 목록
+├── constraints.txt              # 전이 의존성까지 고정한 설치 버전 (CI·Dockerfile 공통)
 └── requirements-dev.txt         # 개발 전용 의존성 (ruff)
 ```
 
@@ -49,10 +50,14 @@ source .venv/bin/activate
 # Windows PowerShell
 .\.venv\Scripts\Activate.ps1
 
-pip install -r requirements.txt -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 ```
 
 `requirements-dev.txt`에는 린터 같은 개발 도구만 들어 있습니다. Dockerfile은 `requirements.txt`만 설치하므로 운영 이미지에는 포함되지 않습니다.
+
+**설치 버전은 `constraints.txt`가 정합니다.** `requirements.txt`는 하한만 적으므로 `-c constraints.txt` 없이 설치하면
+그날의 최신판이 들어와 CI와 다른 결과가 나올 수 있습니다(#62). CI와 Dockerfile도 같은 파일로 설치합니다.
+의존성을 올리거나 추가할 때는 `constraints.txt`를 같은 PR에서 고치고 CI로 확인합니다.
 
 ## 2. 환경변수
 
@@ -148,6 +153,33 @@ alembic upgrade head              # 최신 리비전까지 스키마 적용
 ```
 
 이미 적용된 리비전 파일은 수정하지 않는 것이 이 저장소의 규칙입니다. 스키마를 바꿔야 하면 새 리비전을 만드세요.
+
+### `d4f8a2b16c07`에서 멈춘다면
+
+`verification_logs`에 행이 남아 있는 DB에서는 이 리비전이 **의도적으로 실패합니다.**
+
+```
+Running upgrade 69dc2d9f707c -> d4f8a2b16c07, align verification_logs with revised verification flow
+psycopg2.errors.NotNullViolation:
+  column "kiosk_id" of relation "verification_logs" contains null values
+```
+
+마이그레이션이 깨진 것이 아닙니다. 그 행들은 **결과 기록 API가 없던 시절에 손으로 넣은 시드**이고,
+개정된 흐름에서 채울 `kiosk_id`가 없습니다. 리비전 docstring이 *"데이터를 조용히 지우는 것보다
+실패해서 확인하게 하는 편이 낫다"* 고 적어 둔 지점입니다(#31 · PR #40).
+
+남은 행이 개정 이전 데이터인지 확인하고(정상값이 `SUCCESS`면 옛 규약입니다. 지금은 `PASS`)
+비운 뒤 다시 올리세요.
+
+```bash
+# DATABASE_URL을 psql에 그대로 주면 안 됩니다 — +asyncpg가 붙어 있어 psql이 URI로
+# 읽지 않고 조용히 기본 접속으로 떨어집니다. 컨테이너로 붙는 편이 확실합니다.
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*), result_status FROM verification_logs GROUP BY result_status;"
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "TRUNCATE verification_logs;"
+alembic upgrade head
+```
+
+버릴 수 없는 행이라면 지우지 말고 팀에 알리세요 — 그런 행이 생겼다는 것 자체가 확인할 일입니다.
 
 ## 4. 서버 실행
 
