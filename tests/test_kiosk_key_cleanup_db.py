@@ -158,7 +158,6 @@ class KioskKeyCleanupDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(app_main, "AsyncSessionLocal", self.session_factory),
-            patch.object(app_main.settings, "kafka_publisher_enabled", False),
             patch.object(kiosk_key_cleanup, "revoke_unused_keys_once", observed_cleanup),
         ):
             async with app_main.lifespan(app_main.app):

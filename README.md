@@ -190,6 +190,21 @@ uvicorn app.main:app --reload
 - Swagger UI: http://localhost:8000/docs
 - 전체 스택을 컨테이너로 띄우려면 `docker compose up`
 
+### Outbox → Kafka Publisher
+
+감사 이벤트를 Kafka로 내보내는 Publisher는 API와 **별도 프로세스**로 돕니다. compose에서는
+`publisher` 서비스이고, 호스트에서 직접 띄우려면:
+
+```bash
+python -m app.workers.publisher
+```
+
+API 안의 백그라운드 태스크가 아니라 별도 프로세스인 이유는 죽었을 때 보이게 하기 위해서입니다.
+루프가 예외로 끝나면 프로세스가 종료되고 컨테이너가 `Restarting`으로 표시되며, `docker logs agetrust-publisher`에
+traceback이 남습니다. Kafka 없이 API만 쓰려면 이 프로세스를 띄우지 않으면 됩니다.
+
+로그 레벨은 `LOG_LEVEL`(기본 `INFO`)로 조절하며 API와 Publisher에 같이 적용됩니다.
+
 ## 5. 린트
 
 규칙은 `pyproject.toml`의 `[tool.ruff]`에 있고, CI가 도는 명령과 같습니다.
@@ -297,10 +312,8 @@ RETURNING id, platform_role;
 이미 폐기된 상태의 시각·이벤트는 중복 기록하지 않습니다. 단말 폐기 후 인증은 키 검사에서
 `401 KIOSK_KEY_INVALID`로 거절됩니다. 이 작업은 이미 인증을 통과한 요청을 소급 취소하지 않습니다.
 
-현재 API 종료 시에는 Publisher의 진행 중 배치 커밋을 최대 10초 먼저 기다리고,
-미사용 키 정리는 최대 2초 기다린 뒤 취소·회수합니다. 한 태스크의 예외가 다른 태스크의
-종료 처리를 건너뛰지 않게 합니다. PR #51의 Publisher 별도 프로세스 변경을 반영할 때는
-API의 미사용 키 정리 lifespan을 유지하고 Publisher 종료 책임만 별도 프로세스로 옮겨야 합니다.
+API 종료 시 미사용 키 정리는 최대 2초 기다린 뒤 취소·회수합니다. Outbox Publisher는
+별도 프로세스(`publisher` 서비스)라 API 종료와 무관하게 자기 SIGTERM 처리로 끝납니다.
 
 마이그레이션 전의 유일한 정상 키 해시는 `legacy__` 표식으로 보존되지만 원문은 복구할 수
 없습니다. 동일한 해시가 여러 키오스크에 있던 경우는 기존에도 인증이 거부됐으므로 옮기지
