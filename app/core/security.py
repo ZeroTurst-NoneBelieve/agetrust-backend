@@ -59,18 +59,20 @@ def _create_login_token(subject: int, token_type: str, expires: timedelta,
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 
 
-def create_access_token(user_id: int, platform_role: str) -> str:
+def create_access_token(user_id: int, platform_role: str, token_version: int = 0) -> str:
+    # ver는 users.token_version이다. 정지·비밀번호 변경으로 값이 올라가면 이 토큰은 무효가 된다 (#66).
     return _create_login_token(
         subject=user_id, token_type="access",
         expires=timedelta(minutes=settings.access_token_expire_minutes),
-        extra={"platform_role": platform_role},
+        extra={"platform_role": platform_role, "ver": token_version},
     )
 
 
-def create_refresh_token(user_id: int) -> str:
+def create_refresh_token(user_id: int, token_version: int = 0) -> str:
     return _create_login_token(
         subject=user_id, token_type="refresh",
         expires=timedelta(days=settings.refresh_token_expire_days),
+        extra={"ver": token_version},
     )
 
 
