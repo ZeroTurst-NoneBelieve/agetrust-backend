@@ -798,7 +798,7 @@ async def me(user: User = Depends(get_current_user_allowing_password_change)):
         },
         403: {
             "model": AuthErrorResponse,
-            "description": "계정이 정지·탈퇴됨(ACCOUNT_INACTIVE)",
+            "description": "계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · 임시 비밀번호 만료(TEMP_PASSWORD_EXPIRED)",
         },
     },
 )
@@ -823,6 +823,11 @@ async def change_password(
         raise _fail(AuthError.INVALID_CREDENTIALS, status.HTTP_400_BAD_REQUEST)
     if verify_password(body.new_password, locked.password_hash):
         raise _fail(AuthError.PASSWORD_REUSED, status.HTTP_400_BAD_REQUEST)
+
+    # 로그인 후 기한이 지났더라도 유효한 액세스 토큰으로 우회할 수 없도록 재검사한다.
+    block_reason = _login_block_reason(locked)
+    if block_reason is not None:
+        raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
 
     was_temporary = locked.must_change_password
     locked.password_hash = hash_password(body.new_password)

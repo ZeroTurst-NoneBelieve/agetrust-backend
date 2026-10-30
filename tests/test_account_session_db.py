@@ -211,6 +211,42 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
             self.assertEqual(audit.payload, {"reason": "TEMP_PASSWORD_EXPIRED"})
 
+    async def test_temp_password_expired_after_login_cannot_be_changed(self):
+        kiosk = await self._create_kiosk_account()
+        login = await self._login(kiosk.login_id, TEMP_PASSWORD)
+        self.assertEqual(login.status_code, 200, login.text)
+        tokens = login.json()
+
+        async with self.session_factory() as db:
+            stored = await db.get(User, kiosk.id)
+            original_hash = stored.password_hash
+            original_version = stored.token_version
+            stored.temp_password_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            await db.commit()
+
+        # 액세스 토큰은 아직 유효하지만 임시 비밀번호 변경 기한은 지났다.
+        me = await self.client.get("/api/v1/auth/me", headers=self._bearer(tokens["access_token"]))
+        self.assertEqual(me.status_code, 200, me.text)
+        changed = await self.client.post(
+            "/api/v1/auth/password",
+            json={"current_password": TEMP_PASSWORD, "new_password": NEW_PASSWORD},
+            headers=self._bearer(tokens["access_token"]),
+        )
+        self._assert_error(changed, 403, "TEMP_PASSWORD_EXPIRED")
+        async with self.session_factory() as db:
+            stored = await db.get(User, kiosk.id)
+            self.assertEqual(stored.password_hash, original_hash)
+            self.assertEqual(stored.token_version, original_version)
+            self.assertTrue(stored.must_change_password)
+            self.assertIsNotNone(stored.temp_password_expires_at)
+            audit = await db.execute(
+                select(AuditLog).where(
+                    AuditLog.event_type == "PASSWORD_CHANGED",
+                    AuditLog.aggregate_id == str(kiosk.id),
+                )
+            )
+            self.assertIsNone(audit.scalar_one_or_none())
+
     async def test_suspended_account_cannot_log_in_and_version_bump_revokes_tokens(self):
         kiosk = await self._create_kiosk_account()
         tokens = (await self._login(kiosk.login_id, TEMP_PASSWORD)).json()
