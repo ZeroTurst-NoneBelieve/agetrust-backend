@@ -385,7 +385,79 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 인증·동시 재전송·본문 불일치·감사/Outbox 원자성을 검증합니다. 각 테스트가 만든 별도 스키마를
 끝에 제거하므로 테스트 DB 계정에 `CREATE SCHEMA` 권한이 필요합니다.
 
-## 9. CI
+## 9. KIOSK 계정과 앱 권한 분기 (#66)
+
+사용자 앱과 키오스크 앱은 하나의 앱이고, 같은 `POST /api/v1/auth/login`으로 로그인합니다.
+로그인 뒤 `GET /api/v1/auth/me`의 `platform_role`이 `USER`면 사용자 화면, `KIOSK`면 키오스크
+화면으로 나눕니다. KIOSK 계정은 공개 회원가입으로 만들 수 없고 관리자가 만듭니다. 전화번호가
+없습니다. 7번의 키오스크 **단말 API Key**(상태 목록 조회·결과 업로드용)와는 별개이며, 그
+흐름은 바뀌지 않았습니다.
+
+### 관리자: 계정 만들기
+
+`POST /api/v1/admin/kiosk-accounts`에 관리자 JWT로 다음을 보냅니다.
+
+```json
+{
+  "login_id": "gangnam-kiosk",
+  "name": "강남점 키오스크",
+  "business_number": "123-45-67890",
+  "business_name": "에이지트러스트 편의점",
+  "contact_number": null
+}
+```
+
+- 사업자등록번호가 이미 `businesses`에 있으면 그 사업자에, 없으면 새로 만들어
+  `business_memberships`에 `OWNER`로 연결합니다. 이미 있는 사업자의 상호·연락처는 바꾸지
+  않습니다. 정지·해지된 사업자면 `409 BUSINESS_INACTIVE`입니다.
+- 응답(201)의 `temporary_password`는 **이 응답에서만 한 번** 나옵니다. 12자이며 헷갈리는
+  글자(0·O, 1·l·I)는 쓰지 않습니다. 72시간 안에 첫 로그인해서 바꿔야 합니다. 7번의 API Key처럼
+  파일·채팅·로그·화면 캡처에 보관하지 말고 매장에 안전하게 전달하세요.
+- DB에는 bcrypt 해시만, 감사 로그(`KIOSK_ACCOUNT_CREATED`)에는 비밀번호 없이 아이디·사업자 ID만
+  남습니다.
+
+| 요청 | 동작 |
+|---|---|
+| `GET /api/v1/admin/kiosk-accounts?status=&limit=&offset=` | 목록 (최근 생성 순) |
+| `GET /api/v1/admin/kiosk-accounts/{id}` | 상세. USER·ADMIN 계정 ID는 `404 KIOSK_ACCOUNT_NOT_FOUND` |
+| `POST /api/v1/admin/kiosk-accounts/{id}/suspend` | 정지. 이미 발급된 토큰은 즉시 무효 (`KIOSK_ACCOUNT_SUSPENDED`) |
+| `POST /api/v1/admin/kiosk-accounts/{id}/activate` | 정지 해제. 정지 전 토큰은 계속 무효 (`KIOSK_ACCOUNT_ACTIVATED`) |
+| `POST /api/v1/admin/kiosk-accounts/{id}/reset-password` | 새 임시 비밀번호 발급. 기존 비밀번호·토큰 무효 (`KIOSK_ACCOUNT_PASSWORD_RESET`) |
+
+정지·해제는 이미 그 상태면 아무것도 바꾸지 않고 감사 로그도 남기지 않습니다. 비밀번호 재발급은
+정지 상태를 바꾸지 않습니다.
+
+### 앱: 첫 로그인
+
+1. `POST /api/v1/auth/login`에 아이디와 임시 비밀번호를 보내 토큰을 받습니다.
+2. `GET /api/v1/auth/me`에서 `platform_role`과 `must_change_password`를 확인합니다.
+   `must_change_password`가 `true`면 비밀번호 변경 화면을 먼저 띄웁니다.
+3. `POST /api/v1/auth/password`에 `{"current_password": "<임시>", "new_password": "<8자 이상>"}`을
+   보냅니다. 응답의 **새 토큰으로 교체**합니다. 이전 토큰은 무효가 됩니다.
+
+비밀번호를 바꾸기 전에는 `/auth/me`와 `/auth/password` 외의 API가 `403 PASSWORD_CHANGE_REQUIRED`입니다.
+`POST /api/v1/auth/password`는 USER 계정도 비밀번호 변경에 쓸 수 있습니다.
+
+임시 비밀번호는 발급 후 72시간 이내에 변경을 완료해야 합니다. 기한 안에 로그인했더라도 변경 요청 시 만료되었다면 거부되며, 관리자에게 재발급을 요청해야 합니다.
+
+| 응답 | 의미 / 앱 동작 |
+|---|---|
+| `401 INVALID_CREDENTIALS` | 아이디 또는 비밀번호가 틀림 (계정 존재 여부는 알려주지 않음) |
+| `403 ACCOUNT_INACTIVE` | 로그인: 비밀번호는 맞지만 정지된 계정. 관리자에게 문의 |
+| `403 TEMP_PASSWORD_EXPIRED` | 로그인·비밀번호 변경: 임시 비밀번호 기한(72시간) 지남. 관리자에게 재발급 요청 |
+| `403 PASSWORD_CHANGE_REQUIRED` | 임시 비밀번호 상태. 비밀번호 변경 화면으로 이동 |
+| `401 TOKEN_REVOKED` | 정지·비밀번호 변경·재발급으로 무효가 된 토큰. 로그인 화면으로 |
+| `403 PERMISSION_DENIED` | KIOSK 계정이 지갑 API(기기 등록, Holder 키, 성인 판정, VC 발급)를 호출함 |
+
+로그인 토큰에는 `users.token_version`이 `ver` 클레임으로 들어가며, 정지·비밀번호 변경·재발급 때
+값이 올라가 그 전 토큰(리프레시 포함)이 모두 무효가 됩니다. `ver`가 없는 기존 토큰은 0으로 보므로
+기존 USER·ADMIN 계정은 영향이 없습니다.
+
+`tests/test_account_session_db.py`(로그인·임시 비밀번호·토큰 무효화)와
+`tests/test_kiosk_account_admin_db.py`(관리자 계정 관리)는 `E2E_DATABASE_URL`이 있을 때 실제
+PostgreSQL로 검증합니다.
+
+## 10. CI
 
 `dev`/`main` 대상 PR과 두 브랜치로의 push에서 `.github/workflows/ci.yml`이 돕니다.
 

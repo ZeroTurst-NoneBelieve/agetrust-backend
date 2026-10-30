@@ -80,10 +80,17 @@ class UserResponse(BaseModel):
     id: int = Field(description="사용자 ID.")
     login_id: str = Field(description="로그인 아이디.")
     name: str = Field(description="사용자 이름.")
-    phone_number: str = Field(description="인증된 전화번호(E.164).")
+    phone_number: str | None = Field(
+        default=None, description="인증된 전화번호(E.164). KIOSK 계정은 없다(null)."
+    )
     platform_role: str = Field(
         description="플랫폼 권한. 가맹점 권한(business_role)과는 별개다.",
-        examples=["USER", "ADMIN"],
+        examples=["USER", "ADMIN", "KIOSK"],
+    )
+    status: str = Field(description="계정 상태.", examples=["ACTIVE", "SUSPENDED"])
+    must_change_password: bool = Field(
+        default=False,
+        description="관리자가 발급한 임시 비밀번호 상태. true면 비밀번호부터 바꿔야 다른 API를 쓸 수 있다.",
     )
 
     model_config = {"from_attributes": True}
@@ -113,7 +120,7 @@ class TokenResponse(BaseModel):
     refresh_token: str = Field(
         description=(
             "액세스 토큰 재발급용 토큰(JWT). "
-            "MVP에서는 블랙리스트를 두지 않으므로 만료 전까지 유효하다."
+            "블랙리스트는 없지만 계정 정지·비밀번호 변경 시 무효가 된다."
         )
     )
     token_type: str = "bearer"
@@ -123,3 +130,10 @@ class RefreshRequest(BaseModel):
     """토큰 재발급 요청."""
 
     refresh_token: str = Field(description="로그인 시 발급받은 리프레시 토큰.")
+
+
+class PasswordChangeRequest(BaseModel):
+    """비밀번호 변경 요청. 임시 비밀번호로 처음 로그인한 KIOSK 계정도 이것으로 바꾼다."""
+
+    current_password: str = Field(description="현재 비밀번호(임시 비밀번호 포함).")
+    new_password: str = Field(min_length=8, description="새 비밀번호. 최소 8자.")

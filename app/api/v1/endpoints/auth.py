@@ -16,8 +16,8 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
-from app.api.errors import AUTHENTICATED_RESPONSES, api_error
+from app.api.deps import get_current_user_allowing_password_change, is_token_revoked, require_wallet_user
+from app.api.errors import AUTHENTICATED_RESPONSES, SESSION_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import mask_phone, record_audit_event
 from app.core.did_key import load_public_key_pem, public_key_to_did_key
@@ -35,6 +35,7 @@ from app.core.security import (
     hash_otp,
     hash_password,
     verify_otp,
+    verify_password,
     verify_password_or_dummy,
 )
 from app.core.sms import (
@@ -54,6 +55,7 @@ from app.schemas.device import BindHolderKeyRequest, DeviceResponse, RegisterDev
 from app.schemas.errors import AuthError, AuthErrorResponse, VcError, VcErrorResponse
 from app.schemas.user import (
     LoginRequest,
+    PasswordChangeRequest,
     PhoneRequestBody,
     PhoneRequestResponse,
     PhoneVerifyBody,
@@ -83,6 +85,29 @@ def _fail(
 ):
     """인증 실패가 기본이라 401을 기본값으로 둔다. 본문 형태는 공용 생성기가 정한다."""
     return api_error(code, status_code, headers=headers)
+
+
+def _login_block_reason(user: User) -> AuthError | None:
+    """비밀번호는 맞지만 로그인을 막아야 하는 사유 (#66).
+
+    정지·탈퇴 계정, 그리고 기한 안에 바꾸지 않은 임시 비밀번호.
+    """
+    if user.status != "ACTIVE":
+        return AuthError.ACCOUNT_INACTIVE
+    if (
+        user.must_change_password
+        and user.temp_password_expires_at is not None
+        and user.temp_password_expires_at <= datetime.now(timezone.utc)
+    ):
+        return AuthError.TEMP_PASSWORD_EXPIRED
+    return None
+
+
+def _issue_tokens(user: User) -> TokenResponse:
+    return TokenResponse(
+        access_token=create_access_token(user.id, user.platform_role, user.token_version),
+        refresh_token=create_refresh_token(user.id, user.token_version),
+    )
 
 
 async def _find_active_phone_verification(
@@ -609,13 +634,23 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
         401: {
             "model": AuthErrorResponse,
             "description": "아이디 또는 비밀번호가 올바르지 않음",
-        }
+        },
+        403: {
+            "model": AuthErrorResponse,
+            "description": (
+                "비밀번호는 맞지만 계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · "
+                "임시 비밀번호 사용 기한이 지남(TEMP_PASSWORD_EXPIRED)"
+            ),
+        },
     },
 )
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     """로그인하고 액세스·리프레시 토큰을 발급받는다.
 
-    실패 사유는 계정 존재 여부를 드러내지 않도록 하나로 통일한다.
+    아이디·비밀번호 실패 사유는 계정 존재 여부를 드러내지 않도록 하나로 통일한다.
+    계정 상태(403)는 비밀번호가 맞은 뒤에만 알려준다.
+    USER·KIOSK 모두 이 경로로 로그인하고, 앱은 /auth/me의 platform_role로
+    화면을 나눈다. must_change_password가 true면 비밀번호부터 바꿔야 한다 (#66).
     """
     result = await db.execute(select(User).where(User.login_id == body.login_id))
     user = result.scalar_one_or_none()
@@ -642,6 +677,21 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         await db.commit()
         raise _fail(AuthError.INVALID_CREDENTIALS)
 
+    block_reason = _login_block_reason(user)
+    if block_reason is not None:
+        await record_audit_event(
+            db,
+            event_type=AuditEventType.LOGIN_FAILED.value,
+            actor_type=AuditActorType.USER.value,
+            actor_ref=body.login_id,
+            aggregate_type=AuditAggregateType.USER.value,
+            # 비밀번호가 맞은 경우라 계정 존재를 숨길 이유가 없다.
+            aggregate_id=str(user.id),
+            payload={"reason": block_reason.value},
+        )
+        await db.commit()
+        raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
+
     await record_audit_event(
         db,
         event_type=AuditEventType.LOGIN_SUCCEEDED.value,
@@ -653,14 +703,15 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         actor_ref=str(user.id),
         aggregate_type=AuditAggregateType.USER.value,
         aggregate_id=str(user.id),
-        payload={"login_id": user.login_id, "platform_role": user.platform_role},
+        payload={
+            "login_id": user.login_id,
+            "platform_role": user.platform_role,
+            "must_change_password": user.must_change_password,
+        },
     )
     await db.commit()
 
-    return TokenResponse(
-        access_token=create_access_token(user.id, user.platform_role),
-        refresh_token=create_refresh_token(user.id),
-    )
+    return _issue_tokens(user)
 
 
 @router.post(
@@ -670,7 +721,11 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     responses={
         401: {
             "model": AuthErrorResponse,
-            "description": "리프레시 토큰이 유효하지 않거나 만료됨",
+            "description": (
+                "리프레시 토큰이 유효하지 않거나 만료됨 · 계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · "
+                "정지·비밀번호 변경으로 무효가 된 토큰(TOKEN_REVOKED) · "
+                "임시 비밀번호 사용 기한이 지남(TEMP_PASSWORD_EXPIRED)"
+            ),
         }
     },
 )
@@ -679,6 +734,7 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
 
     MVP 범위에서는 리프레시 토큰 블랙리스트를 두지 않으므로,
     재발급 후에도 이전 리프레시 토큰은 만료 전까지 유효하다.
+    단, 계정 정지·비밀번호 변경으로 token_version이 바뀌면 이전 토큰은 모두 무효다 (#66).
     """
     try:
         claims = decode_login_token(body.refresh_token, expected_type="refresh")
@@ -689,10 +745,13 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
     if user is None:
         raise _fail(AuthError.USER_NOT_FOUND)
 
-    return TokenResponse(
-        access_token=create_access_token(user.id, user.platform_role),
-        refresh_token=create_refresh_token(user.id),
-    )
+    if is_token_revoked(user, claims):
+        raise _fail(AuthError.TOKEN_REVOKED)
+    block_reason = _login_block_reason(user)
+    if block_reason is not None:
+        raise _fail(block_reason)
+
+    return _issue_tokens(user)
 
 
 @router.post(
@@ -713,11 +772,86 @@ async def logout():
     "/me",
     response_model=UserResponse,
     summary="내 정보 조회",
-    responses=AUTHENTICATED_RESPONSES,
+    responses=SESSION_RESPONSES,
 )
-async def me(user: User = Depends(get_current_user)):
-    """액세스 토큰으로 본인 정보를 조회한다."""
+async def me(user: User = Depends(get_current_user_allowing_password_change)):
+    """액세스 토큰으로 본인 정보를 조회한다.
+
+    임시 비밀번호 상태에서도 호출할 수 있다. 앱은 여기서 받은
+    platform_role(USER/KIOSK)과 must_change_password로 첫 화면을 고른다 (#66).
+    """
     return user
+
+
+@router.post(
+    "/password",
+    response_model=TokenResponse,
+    summary="비밀번호 변경",
+    responses={
+        **SESSION_RESPONSES,
+        400: {
+            "model": AuthErrorResponse,
+            "description": (
+                "현재 비밀번호가 틀림(INVALID_CREDENTIALS) · "
+                "새 비밀번호가 현재 비밀번호와 같음(PASSWORD_REUSED)"
+            ),
+        },
+        403: {
+            "model": AuthErrorResponse,
+            "description": "계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · 임시 비밀번호 만료(TEMP_PASSWORD_EXPIRED)",
+        },
+    },
+)
+async def change_password(
+    body: PasswordChangeRequest,
+    user: User = Depends(get_current_user_allowing_password_change),
+    db: AsyncSession = Depends(get_db),
+):
+    """비밀번호를 바꾸고 새 토큰을 발급한다.
+
+    임시 비밀번호로 처음 로그인한 KIOSK 계정은 이 API로 비밀번호를 바꿔야
+    다른 API를 쓸 수 있다. 바꾸면 token_version이 올라가 이전에 발급된
+    토큰은 모두 무효가 되므로, 응답의 새 토큰으로 교체해야 한다 (#66).
+    """
+    # 같은 계정의 동시 변경 요청을 직렬화한다.
+    locked = await db.get(User, user.id, with_for_update=True, populate_existing=True)
+    if locked is None:
+        raise _fail(AuthError.USER_NOT_FOUND)
+    if locked.status != "ACTIVE":
+        raise _fail(AuthError.ACCOUNT_INACTIVE, status.HTTP_403_FORBIDDEN)
+    if not verify_password(body.current_password, locked.password_hash):
+        raise _fail(AuthError.INVALID_CREDENTIALS, status.HTTP_400_BAD_REQUEST)
+    if verify_password(body.new_password, locked.password_hash):
+        raise _fail(AuthError.PASSWORD_REUSED, status.HTTP_400_BAD_REQUEST)
+
+    # 로그인 후 기한이 지났더라도 유효한 액세스 토큰으로 우회할 수 없도록 재검사한다.
+    block_reason = _login_block_reason(locked)
+    if block_reason is not None:
+        raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
+
+    was_temporary = locked.must_change_password
+    locked.password_hash = hash_password(body.new_password)
+    locked.must_change_password = False
+    locked.temp_password_expires_at = None
+    locked.token_version += 1
+    locked.updated_at = datetime.now(timezone.utc)
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.PASSWORD_CHANGED.value,
+        actor_type=(
+            AuditActorType.ADMIN.value
+            if locked.platform_role == "ADMIN"
+            else AuditActorType.USER.value
+        ),
+        actor_ref=str(locked.id),
+        aggregate_type=AuditAggregateType.USER.value,
+        aggregate_id=str(locked.id),
+        payload={"was_temporary": was_temporary},
+    )
+    await db.commit()
+
+    return _issue_tokens(locked)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +864,7 @@ async def me(user: User = Depends(get_current_user)):
     responses=AUTHENTICATED_RESPONSES,
 )
 async def register_device(
-    body: RegisterDeviceRequest, user: User = Depends(get_current_user),
+    body: RegisterDeviceRequest, user: User = Depends(require_wallet_user),
     db: AsyncSession = Depends(get_db),
 ):
     """기기를 등록한다.
@@ -775,7 +909,7 @@ async def register_device(
     },
 )
 async def bind_holder_key(
-    body: BindHolderKeyRequest, user: User = Depends(get_current_user),
+    body: BindHolderKeyRequest, user: User = Depends(require_wallet_user),
     db: AsyncSession = Depends(get_db),
 ):
     """기기에 Holder 공개키를 등록하고 did:key를 파생한다.
@@ -857,7 +991,7 @@ async def bind_holder_key(
     summary="내 기기 목록 조회",
     responses=AUTHENTICATED_RESPONSES,
 )
-async def list_my_devices(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def list_my_devices(user: User = Depends(require_wallet_user), db: AsyncSession = Depends(get_db)):
     """본인이 등록한 기기 목록을 조회한다."""
     result = await db.execute(select(Device).where(Device.user_id == user.id))
     return result.scalars().all()

@@ -38,9 +38,16 @@ def _deny(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
     return api_error(code, status_code)
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    db: AsyncSession = Depends(get_db),
+def is_token_revoked(user: User, claims: dict) -> bool:
+    """정지·비밀번호 초기화·변경으로 token_version이 올라가기 전에 발급된 토큰인가 (#66).
+
+    ver가 없는 예전 토큰은 0으로 본다. 그래서 기존 계정의 토큰은 그대로 쓸 수 있다.
+    """
+    return claims.get("ver", 0) != user.token_version
+
+
+async def _authenticated_user(
+    credentials: HTTPAuthorizationCredentials | None, db: AsyncSession
 ) -> User:
     if credentials is None:
         raise _deny(AuthError.TOKEN_MISSING)
@@ -52,6 +59,33 @@ async def get_current_user(
     user = await db.get(User, payload["sub"])
     if user is None:
         raise _deny(AuthError.USER_NOT_FOUND)
+    if is_token_revoked(user, payload):
+        raise _deny(AuthError.TOKEN_REVOKED)
+    return user
+
+
+async def get_current_user_allowing_password_change(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """임시 비밀번호 상태여도 통과한다. 내 정보 조회와 비밀번호 변경에만 쓴다."""
+    return await _authenticated_user(credentials, db)
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    user = await _authenticated_user(credentials, db)
+    if user.must_change_password:
+        raise _deny(AuthError.PASSWORD_CHANGE_REQUIRED, status.HTTP_403_FORBIDDEN)
+    return user
+
+
+async def require_wallet_user(user: User = Depends(get_current_user)) -> User:
+    """지갑 API(기기·Holder 키·성인 판정·VC 발급)는 KIOSK 계정이 쓰지 못한다 (#66)."""
+    if user.platform_role == "KIOSK":
+        raise _deny(AuthError.PERMISSION_DENIED, status.HTTP_403_FORBIDDEN)
     return user
 
 
