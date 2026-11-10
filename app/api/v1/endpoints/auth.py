@@ -25,6 +25,7 @@ from app.core.otp_rate_limit import (
     OtpSmsRateLimiter,
     OtpSmsReservationDenied,
 )
+from app.core.password_attempt_limit import PasswordAttempt, PasswordAttemptLimiter
 from app.core.revocation import revoke_active_credentials_for_device
 from app.core.security import (
     TokenError,
@@ -75,6 +76,17 @@ otp_sms_rate_limiter = OtpSmsRateLimiter(
     global_limit=settings.otp_request_global_limit,
     global_window_seconds=settings.otp_request_global_window_seconds,
 )
+password_attempt_limiter = PasswordAttemptLimiter(
+    limit=settings.password_failure_limit,
+    window_seconds=settings.password_failure_window_seconds,
+)
+_TOO_MANY_ATTEMPTS_RESPONSE = {
+    "model": AuthErrorResponse,
+    "description": (
+        "비밀번호를 짧은 시간에 여러 번 틀려 잠시 막힘(TOO_MANY_PASSWORD_ATTEMPTS). "
+        "Retry-After 헤더의 초만큼 기다린 뒤 다시 시도한다. 로그인과 비밀번호 변경이 함께 센다."
+    ),
+}
 
 
 def _fail(
@@ -105,6 +117,48 @@ def _login_block_reason(user: User) -> AuthError | None:
 
 def _actor_type(user: User) -> str:
     return AuditActorType.ADMIN.value if user.platform_role == "ADMIN" else AuditActorType.USER.value
+
+
+async def _acquire_password_attempt(login_id: str) -> PasswordAttempt:
+    """비밀번호를 검사하기 전에 시도 한 번을 센다. 한도에 걸렸으면 429로 막는다 (#68).
+
+    없는 아이디도 똑같이 세고 막아서, 응답으로 계정 존재 여부가 드러나지 않는다.
+    비밀번호가 맞으면 호출자가 password_attempt_limiter.clear로 기록을 지운다.
+    """
+    attempt = await password_attempt_limiter.acquire(login_id)
+    if not attempt.allowed:
+        raise _fail(
+            AuthError.TOO_MANY_PASSWORD_ATTEMPTS,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(attempt.retry_after)},
+        )
+    return attempt
+
+
+async def _audit_if_locked(
+    db: AsyncSession, attempt: PasswordAttempt, *, login_id: str, user: User | None, endpoint: str
+) -> None:
+    """틀린 시도로 계정이 막히기 시작했으면 감사 로그를 한 번 남긴다. 커밋은 호출자가 한다.
+
+    막혀 있는 동안의 요청은 감사 로그를 남기지 않는다. 대입 공격이 감사 로그를
+    대량으로 쌓는 통로가 되지 않게 하기 위해서다.
+    """
+    if not attempt.reached_limit:
+        return
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.PASSWORD_ATTEMPTS_LOCKED.value,
+        actor_type=_actor_type(user) if user is not None else AuditActorType.USER.value,
+        actor_ref=login_id,
+        aggregate_type=AuditAggregateType.USER.value,
+        # 로그인 실패와 같은 이유로 계정 존재 여부를 남기지 않는다.
+        aggregate_id=str(user.id) if endpoint == "password" else None,
+        payload={
+            "endpoint": endpoint,
+            "failure_limit": settings.password_failure_limit,
+            "window_seconds": settings.password_failure_window_seconds,
+        },
+    )
 
 
 def _issue_tokens(user: User) -> TokenResponse:
@@ -646,6 +700,7 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)):
                 "임시 비밀번호 사용 기한이 지남(TEMP_PASSWORD_EXPIRED)"
             ),
         },
+        429: _TOO_MANY_ATTEMPTS_RESPONSE,
     },
 )
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
@@ -656,6 +711,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     USER·KIOSK 모두 이 경로로 로그인하고, 앱은 /auth/me의 platform_role로
     화면을 나눈다. must_change_password가 true면 비밀번호부터 바꿔야 한다 (#66).
     """
+    attempt = await _acquire_password_attempt(body.login_id)
     result = await db.execute(select(User).where(User.login_id == body.login_id))
     user = result.scalar_one_or_none()
     password_matches = verify_password_or_dummy(
@@ -678,8 +734,12 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
             aggregate_id=None,
             payload={"reason": AuthError.INVALID_CREDENTIALS.value},
         )
+        await _audit_if_locked(db, attempt, login_id=body.login_id, user=None, endpoint="login")
         await db.commit()
         raise _fail(AuthError.INVALID_CREDENTIALS)
+
+    # 비밀번호가 맞았으므로 정지 등으로 로그인이 막히더라도 실패 기록은 지운다.
+    await password_attempt_limiter.clear(body.login_id)
 
     block_reason = _login_block_reason(user)
     if block_reason is not None:
@@ -807,6 +867,7 @@ async def me(user: User = Depends(get_current_user_allowing_password_change)):
             "model": AuthErrorResponse,
             "description": "계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · 임시 비밀번호 만료(TEMP_PASSWORD_EXPIRED)",
         },
+        429: _TOO_MANY_ATTEMPTS_RESPONSE,
     },
 )
 async def change_password(
@@ -829,6 +890,8 @@ async def change_password(
     block_reason = _login_block_reason(locked)
     if block_reason is not None:
         raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
+    # 로그인과 같은 계정 키로 센다. 탈취한 토큰으로 이 API에서 대입을 이어갈 수 없다.
+    attempt = await _acquire_password_attempt(locked.login_id)
     if not verify_password(body.current_password, locked.password_hash):
         # 탈취한 토큰으로 현재 비밀번호를 대입해 보는 시도를 추적할 수 있게 남긴다.
         await record_audit_event(
@@ -840,8 +903,10 @@ async def change_password(
             aggregate_id=str(locked.id),
             payload={"reason": AuthError.INVALID_CREDENTIALS.value},
         )
+        await _audit_if_locked(db, attempt, login_id=locked.login_id, user=locked, endpoint="password")
         await db.commit()
         raise _fail(AuthError.INVALID_CREDENTIALS, status.HTTP_400_BAD_REQUEST)
+    await password_attempt_limiter.clear(locked.login_id)
     if verify_password(body.new_password, locked.password_hash):
         raise _fail(AuthError.PASSWORD_REUSED, status.HTTP_400_BAD_REQUEST)
 

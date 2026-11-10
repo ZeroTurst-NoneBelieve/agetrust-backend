@@ -20,6 +20,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
+from app.api.v1.endpoints.auth import password_attempt_limiter  # noqa: E402
+from app.config import settings  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402
@@ -45,6 +47,9 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
             join_transaction_mode="create_savepoint",
         )
         self.token = uuid.uuid4().hex
+        # 비밀번호 시도 제한은 프로세스 메모리에 남으므로 테스트마다 비운다 (#68).
+        await password_attempt_limiter.reset()
+        self.addAsyncCleanup(password_attempt_limiter.reset)
 
         async def override_db():
             async with self.session_factory() as session:
@@ -368,6 +373,84 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
         devices = await self.client.get("/api/v1/auth/devices", headers=self._bearer(access))
         self.assertEqual(devices.status_code, 200, devices.text)
         self.assertEqual(devices.json(), [])
+
+    async def _locked_audit_rows(self, login_id: str) -> list[AuditLog]:
+        async with self.session_factory() as db:
+            result = await db.execute(
+                select(AuditLog).where(
+                    AuditLog.event_type == "PASSWORD_ATTEMPTS_LOCKED",
+                    AuditLog.actor_ref == login_id,
+                )
+            )
+            return list(result.scalars().all())
+
+    async def test_repeated_wrong_logins_lock_the_account_even_for_the_right_password(self):
+        user = await self._create_wallet_user()
+        limit = settings.password_failure_limit
+        for _ in range(limit):
+            self._assert_error(await self._login(user.login_id, "wrong-pass"), 401, "INVALID_CREDENTIALS")
+
+        # 한도에 걸리면 맞는 비밀번호도 검사하지 않고 막는다.
+        locked = await self._login(user.login_id, USER_PASSWORD)
+        self._assert_error(locked, 429, "TOO_MANY_PASSWORD_ATTEMPTS")
+        self.assertGreater(int(locked.headers["retry-after"]), 0)
+        self._assert_error(await self._login(user.login_id, "wrong-pass"), 429, "TOO_MANY_PASSWORD_ATTEMPTS")
+
+        # 막히기 시작할 때 한 번만 남기고, 계정 존재 여부는 남기지 않는다.
+        rows = await self._locked_audit_rows(user.login_id)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0].aggregate_id)
+        self.assertEqual(rows[0].payload["endpoint"], "login")
+
+        # 다른 계정은 영향이 없다.
+        other = await self._create_kiosk_account()
+        self.assertEqual((await self._login(other.login_id, TEMP_PASSWORD)).status_code, 200)
+
+    async def test_unknown_login_id_is_limited_the_same_way(self):
+        ghost = f"ghost-{self.token}"
+        for _ in range(settings.password_failure_limit):
+            self._assert_error(await self._login(ghost, "wrong-pass"), 401, "INVALID_CREDENTIALS")
+        self._assert_error(await self._login(ghost, "wrong-pass"), 429, "TOO_MANY_PASSWORD_ATTEMPTS")
+
+    async def test_successful_login_clears_earlier_failures(self):
+        user = await self._create_wallet_user()
+        for _ in range(settings.password_failure_limit - 1):
+            await self._login(user.login_id, "wrong-pass")
+        self.assertEqual((await self._login(user.login_id, USER_PASSWORD)).status_code, 200)
+
+        # 성공으로 기록이 지워져 다시 한도만큼 틀릴 수 있다.
+        for _ in range(settings.password_failure_limit - 1):
+            self._assert_error(await self._login(user.login_id, "wrong-pass"), 401, "INVALID_CREDENTIALS")
+        self.assertEqual((await self._login(user.login_id, USER_PASSWORD)).status_code, 200)
+
+    async def test_password_change_failures_share_the_login_limit(self):
+        """탈취한 토큰으로 /auth/password에서 대입해도 로그인과 같은 한도에 걸린다."""
+        user = await self._create_wallet_user()
+        access = (await self._login(user.login_id, USER_PASSWORD)).json()["access_token"]
+
+        for _ in range(settings.password_failure_limit):
+            wrong = await self.client.post(
+                "/api/v1/auth/password",
+                json={"current_password": "wrong-pass", "new_password": NEW_PASSWORD},
+                headers=self._bearer(access),
+            )
+            self._assert_error(wrong, 400, "INVALID_CREDENTIALS")
+
+        right = await self.client.post(
+            "/api/v1/auth/password",
+            json={"current_password": USER_PASSWORD, "new_password": NEW_PASSWORD},
+            headers=self._bearer(access),
+        )
+        self._assert_error(right, 429, "TOO_MANY_PASSWORD_ATTEMPTS")
+        self._assert_error(await self._login(user.login_id, USER_PASSWORD), 429, "TOO_MANY_PASSWORD_ATTEMPTS")
+
+        async with self.session_factory() as db:
+            stored = await db.get(User, user.id)
+            self.assertEqual(stored.token_version, 0)  # 비밀번호는 바뀌지 않았다.
+        rows = await self._locked_audit_rows(user.login_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].aggregate_id, str(user.id))
+        self.assertEqual(rows[0].payload["endpoint"], "password")
 
 
 if __name__ == "__main__":
