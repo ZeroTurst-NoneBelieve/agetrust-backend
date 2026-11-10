@@ -46,6 +46,7 @@ class AuthError(StrEnum):
     # 관리자 KIOSK 계정 관리 (#66)
     KIOSK_ACCOUNT_NOT_FOUND = "KIOSK_ACCOUNT_NOT_FOUND"
     BUSINESS_INACTIVE = "BUSINESS_INACTIVE"
+    BUSINESS_NAME_MISMATCH = "BUSINESS_NAME_MISMATCH"
 
 
 class AuthErrorDetail(BaseModel):

@@ -198,7 +198,7 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self._assert_error(await self._login(kiosk.login_id, "wrong-pass"), 401, "INVALID_CREDENTIALS")
         self._assert_error(await self._login(kiosk.login_id, TEMP_PASSWORD), 403, "TEMP_PASSWORD_EXPIRED")
         refresh = await self.client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
-        self._assert_error(refresh, 401, "TEMP_PASSWORD_EXPIRED")
+        self._assert_error(refresh, 403, "TEMP_PASSWORD_EXPIRED")
 
         async with self.session_factory() as db:
             audit = (
@@ -233,6 +233,13 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
             headers=self._bearer(tokens["access_token"]),
         )
         self._assert_error(changed, 403, "TEMP_PASSWORD_EXPIRED")
+        # 만료 뒤에는 현재 비밀번호가 틀려도 같은 403이라, 이 API로 비밀번호를 확인해 볼 수 없다.
+        wrong = await self.client.post(
+            "/api/v1/auth/password",
+            json={"current_password": "wrong-pass", "new_password": NEW_PASSWORD},
+            headers=self._bearer(tokens["access_token"]),
+        )
+        self._assert_error(wrong, 403, "TEMP_PASSWORD_EXPIRED")
         async with self.session_factory() as db:
             stored = await db.get(User, kiosk.id)
             self.assertEqual(stored.password_hash, original_hash)
@@ -274,13 +281,78 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
 
         refresh = await self.client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
-        self._assert_error(refresh, 401, "ACCOUNT_INACTIVE")
+        self._assert_error(refresh, 403, "ACCOUNT_INACTIVE")
         changed = await self.client.post(
             "/api/v1/auth/password",
             json={"current_password": TEMP_PASSWORD, "new_password": NEW_PASSWORD},
             headers=self._bearer(tokens["access_token"]),
         )
         self._assert_error(changed, 403, "ACCOUNT_INACTIVE")
+        me = await self.client.get("/api/v1/auth/me", headers=self._bearer(tokens["access_token"]))
+        self._assert_error(me, 403, "ACCOUNT_INACTIVE")
+
+    async def test_suspended_wallet_user_access_token_is_refused_without_version_bump(self):
+        """token_version을 올리지 않고 정지돼도 남은 액세스 토큰으로 지갑 API를 쓸 수 없다."""
+        user = await self._create_wallet_user()
+        access = (await self._login(user.login_id, USER_PASSWORD)).json()["access_token"]
+
+        async with self.session_factory() as db:
+            stored = await db.get(User, user.id)
+            stored.status = "SUSPENDED"
+            await db.commit()
+
+        devices = await self.client.get("/api/v1/auth/devices", headers=self._bearer(access))
+        self._assert_error(devices, 403, "ACCOUNT_INACTIVE")
+
+    async def test_wrong_current_password_on_change_is_audited(self):
+        user = await self._create_wallet_user()
+        access = (await self._login(user.login_id, USER_PASSWORD)).json()["access_token"]
+
+        wrong = await self.client.post(
+            "/api/v1/auth/password",
+            json={"current_password": "wrong-pass", "new_password": NEW_PASSWORD},
+            headers=self._bearer(access),
+        )
+        self._assert_error(wrong, 400, "INVALID_CREDENTIALS")
+
+        async with self.session_factory() as db:
+            audit = (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.event_type == "PASSWORD_CHANGE_FAILED",
+                        AuditLog.aggregate_id == str(user.id),
+                    )
+                )
+            ).scalar_one()
+            self.assertEqual(audit.actor_type, "USER")
+            self.assertEqual(audit.payload, {"reason": "INVALID_CREDENTIALS"})
+            self.assertNotIn("wrong-pass", str(audit.payload))
+
+    async def test_blocked_admin_login_is_audited_as_admin(self):
+        async with self.session_factory() as db:
+            admin = User(
+                login_id=f"blocked-admin-{self.token}",
+                password_hash=hash_password(USER_PASSWORD),
+                name="E2E 정지 관리자",
+                phone_number=f"adm-{self.token[:24]}",
+                phone_verified_at=datetime.now(timezone.utc),
+                platform_role="ADMIN",
+                status="SUSPENDED",
+            )
+            db.add(admin)
+            await db.commit()
+
+        self._assert_error(await self._login(admin.login_id, USER_PASSWORD), 403, "ACCOUNT_INACTIVE")
+        async with self.session_factory() as db:
+            audit = (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.event_type == "LOGIN_FAILED",
+                        AuditLog.aggregate_id == str(admin.id),
+                    )
+                )
+            ).scalar_one()
+            self.assertEqual(audit.actor_type, "ADMIN")
 
     async def test_wallet_user_flow_is_unchanged(self):
         user = await self._create_wallet_user()

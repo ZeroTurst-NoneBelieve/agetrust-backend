@@ -443,8 +443,8 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 | 응답 | 의미 / 앱 동작 |
 |---|---|
 | `401 INVALID_CREDENTIALS` | 아이디 또는 비밀번호가 틀림 (계정 존재 여부는 알려주지 않음) |
-| `403 ACCOUNT_INACTIVE` | 로그인: 비밀번호는 맞지만 정지된 계정. 관리자에게 문의 |
-| `403 TEMP_PASSWORD_EXPIRED` | 로그인·비밀번호 변경: 임시 비밀번호 기한(72시간) 지남. 관리자에게 재발급 요청 |
+| `403 ACCOUNT_INACTIVE` | 로그인·토큰 재발급·로그인 후 API: 정지·탈퇴된 계정. 관리자에게 문의 |
+| `403 TEMP_PASSWORD_EXPIRED` | 로그인·토큰 재발급·비밀번호 변경: 임시 비밀번호 기한(72시간) 지남. 관리자에게 재발급 요청 |
 | `403 PASSWORD_CHANGE_REQUIRED` | 임시 비밀번호 상태. 비밀번호 변경 화면으로 이동 |
 | `401 TOKEN_REVOKED` | 정지·비밀번호 변경·재발급으로 무효가 된 토큰. 로그인 화면으로 |
 | `403 PERMISSION_DENIED` | KIOSK 계정이 지갑 API(기기 등록, Holder 키, 성인 판정, VC 발급)를 호출함 |

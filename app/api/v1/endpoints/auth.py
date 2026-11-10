@@ -103,6 +103,10 @@ def _login_block_reason(user: User) -> AuthError | None:
     return None
 
 
+def _actor_type(user: User) -> str:
+    return AuditActorType.ADMIN.value if user.platform_role == "ADMIN" else AuditActorType.USER.value
+
+
 def _issue_tokens(user: User) -> TokenResponse:
     return TokenResponse(
         access_token=create_access_token(user.id, user.platform_role, user.token_version),
@@ -682,7 +686,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         await record_audit_event(
             db,
             event_type=AuditEventType.LOGIN_FAILED.value,
-            actor_type=AuditActorType.USER.value,
+            actor_type=_actor_type(user),
             actor_ref=body.login_id,
             aggregate_type=AuditAggregateType.USER.value,
             # 비밀번호가 맞은 경우라 계정 존재를 숨길 이유가 없다.
@@ -695,11 +699,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     await record_audit_event(
         db,
         event_type=AuditEventType.LOGIN_SUCCEEDED.value,
-        actor_type=(
-            AuditActorType.ADMIN.value
-            if user.platform_role == "ADMIN"
-            else AuditActorType.USER.value
-        ),
+        actor_type=_actor_type(user),
         actor_ref=str(user.id),
         aggregate_type=AuditAggregateType.USER.value,
         aggregate_id=str(user.id),
@@ -722,11 +722,17 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         401: {
             "model": AuthErrorResponse,
             "description": (
-                "리프레시 토큰이 유효하지 않거나 만료됨 · 계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · "
-                "정지·비밀번호 변경으로 무효가 된 토큰(TOKEN_REVOKED) · "
-                "임시 비밀번호 사용 기한이 지남(TEMP_PASSWORD_EXPIRED)"
+                "리프레시 토큰이 유효하지 않거나 만료됨 · "
+                "정지·비밀번호 변경으로 무효가 된 토큰(TOKEN_REVOKED)"
             ),
-        }
+        },
+        403: {
+            "model": AuthErrorResponse,
+            "description": (
+                "계정이 정지·탈퇴됨(ACCOUNT_INACTIVE) · "
+                "임시 비밀번호 사용 기한이 지남(TEMP_PASSWORD_EXPIRED). 로그인과 같은 코드다."
+            ),
+        },
     },
 )
 async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
@@ -749,7 +755,8 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
         raise _fail(AuthError.TOKEN_REVOKED)
     block_reason = _login_block_reason(user)
     if block_reason is not None:
-        raise _fail(block_reason)
+        # 로그인과 같은 403으로 맞춘다. 401이면 앱이 "세션 만료"로 보고 재로그인을 시도한다.
+        raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
 
     return _issue_tokens(user)
 
@@ -817,17 +824,26 @@ async def change_password(
     locked = await db.get(User, user.id, with_for_update=True, populate_existing=True)
     if locked is None:
         raise _fail(AuthError.USER_NOT_FOUND)
-    if locked.status != "ACTIVE":
-        raise _fail(AuthError.ACCOUNT_INACTIVE, status.HTTP_403_FORBIDDEN)
-    if not verify_password(body.current_password, locked.password_hash):
-        raise _fail(AuthError.INVALID_CREDENTIALS, status.HTTP_400_BAD_REQUEST)
-    if verify_password(body.new_password, locked.password_hash):
-        raise _fail(AuthError.PASSWORD_REUSED, status.HTTP_400_BAD_REQUEST)
-
-    # 로그인 후 기한이 지났더라도 유효한 액세스 토큰으로 우회할 수 없도록 재검사한다.
+    # 정지·임시 비밀번호 만료를 비밀번호 검사보다 먼저 본다. 만료된 임시 비밀번호가
+    # 맞는지 이 API로 확인해 볼 수 없게 하고, 유효한 액세스 토큰으로 우회하지도 못하게 한다.
     block_reason = _login_block_reason(locked)
     if block_reason is not None:
         raise _fail(block_reason, status.HTTP_403_FORBIDDEN)
+    if not verify_password(body.current_password, locked.password_hash):
+        # 탈취한 토큰으로 현재 비밀번호를 대입해 보는 시도를 추적할 수 있게 남긴다.
+        await record_audit_event(
+            db,
+            event_type=AuditEventType.PASSWORD_CHANGE_FAILED.value,
+            actor_type=_actor_type(locked),
+            actor_ref=str(locked.id),
+            aggregate_type=AuditAggregateType.USER.value,
+            aggregate_id=str(locked.id),
+            payload={"reason": AuthError.INVALID_CREDENTIALS.value},
+        )
+        await db.commit()
+        raise _fail(AuthError.INVALID_CREDENTIALS, status.HTTP_400_BAD_REQUEST)
+    if verify_password(body.new_password, locked.password_hash):
+        raise _fail(AuthError.PASSWORD_REUSED, status.HTTP_400_BAD_REQUEST)
 
     was_temporary = locked.must_change_password
     locked.password_hash = hash_password(body.new_password)
@@ -839,11 +855,7 @@ async def change_password(
     await record_audit_event(
         db,
         event_type=AuditEventType.PASSWORD_CHANGED.value,
-        actor_type=(
-            AuditActorType.ADMIN.value
-            if locked.platform_role == "ADMIN"
-            else AuditActorType.USER.value
-        ),
+        actor_type=_actor_type(locked),
         actor_ref=str(locked.id),
         aggregate_type=AuditAggregateType.USER.value,
         aggregate_id=str(locked.id),

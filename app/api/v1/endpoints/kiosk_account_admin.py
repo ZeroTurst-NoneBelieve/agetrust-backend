@@ -49,7 +49,10 @@ _CREATE_RESPONSES = {
     **ADMIN_RESPONSES,
     409: {
         "model": AuthErrorResponse,
-        "description": "아이디 중복(USER_ALREADY_EXISTS) · 정지·해지된 사업자(BUSINESS_INACTIVE)",
+        "description": (
+            "아이디 중복(USER_ALREADY_EXISTS) · 정지·해지된 사업자(BUSINESS_INACTIVE) · "
+            "이미 있는 사업자등록번호인데 사업자명이 다름(BUSINESS_NAME_MISMATCH)"
+        ),
     },
 }
 _DETAIL_RESPONSES = {**ADMIN_RESPONSES, 404: _NOT_FOUND}
@@ -138,6 +141,7 @@ async def create_kiosk_account(
     """전화번호 없는 KIOSK 계정을 만들고 임시 비밀번호를 한 번만 돌려준다.
 
     사업자등록번호가 이미 있으면 그 사업자에, 없으면 새 사업자를 만들어 OWNER로 연결한다.
+    이미 있는 사업자인데 사업자명이 다르면 번호를 잘못 넣었을 수 있어 409로 거절한다.
     임시 비밀번호는 72시간 안에 첫 로그인해서 바꿔야 한다.
     """
     response.headers["Cache-Control"] = "no-store"
@@ -165,6 +169,10 @@ async def create_kiosk_account(
         if business.status != "ACTIVE":
             await db.rollback()
             raise _error(AuthError.BUSINESS_INACTIVE, status.HTTP_409_CONFLICT)
+        # 사업자등록번호를 잘못 입력해 다른 사업자의 OWNER로 붙는 일을 막는다.
+        if not business_created and business.business_name.strip() != body.business_name.strip():
+            await db.rollback()
+            raise _error(AuthError.BUSINESS_NAME_MISMATCH, status.HTTP_409_CONFLICT)
 
         account = User(
             login_id=body.login_id,

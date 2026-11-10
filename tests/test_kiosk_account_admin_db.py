@@ -167,6 +167,17 @@ class KioskAccountAdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self._assert_error(await self._create(self._body("a")), 409, "USER_ALREADY_EXISTS")
 
+    async def test_existing_business_number_with_different_name_is_refused(self):
+        first = await self._create(self._body("a"))
+        self.assertEqual(first.status_code, 201, first.text)
+
+        # 사업자등록번호를 잘못 넣어 다른 사업자의 OWNER로 붙는 일을 막는다.
+        mismatched = {**self._body("b"), "business_name": "다른 사업자"}
+        self._assert_error(await self._create(mismatched), 409, "BUSINESS_NAME_MISMATCH")
+        async with self.session_factory() as db:
+            leftover = await db.execute(select(User).where(User.login_id == mismatched["login_id"]))
+            self.assertIsNone(leftover.scalar_one_or_none())
+
     async def test_inactive_business_is_refused(self):
         async with self.session_factory() as db:
             db.add(Business(business_number=f"closed-{self.token}", business_name="해지 사업자", status="TERMINATED"))

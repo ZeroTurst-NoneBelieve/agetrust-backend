@@ -61,6 +61,9 @@ async def _authenticated_user(
         raise _deny(AuthError.USER_NOT_FOUND)
     if is_token_revoked(user, payload):
         raise _deny(AuthError.TOKEN_REVOKED)
+    # token_version을 올리지 않고 정지·탈퇴된 경우(직접 DB 수정 등)에도 남은 토큰을 막는다.
+    if user.status != "ACTIVE":
+        raise _deny(AuthError.ACCOUNT_INACTIVE, status.HTTP_403_FORBIDDEN)
     return user
 
 
