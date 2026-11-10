@@ -297,7 +297,8 @@ class KioskAdminDatabaseTests(unittest.IsolatedAsyncioTestCase):
             f"/api/v1/admin/kiosks/{identifier}/keys", json={}, headers=self.admin_headers
         )
         self.assertEqual(denied.status_code, 403)
-        self.assertEqual(denied.json()["detail"]["code"], "PERMISSION_DENIED")
+        # 정지된 계정은 권한 확인 전에 토큰 검증 단계에서 막힌다.
+        self.assertEqual(denied.json()["detail"]["code"], "ACCOUNT_INACTIVE")
         async with self.session_factory() as db:
             admin = await db.get(User, self.admin_id)
             admin.status = "ACTIVE"

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, Response, status
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_kiosk, get_current_user
+from app.api.deps import get_current_kiosk, require_wallet_user
 from app.api.errors import AUTHENTICATED_RESPONSES, api_error
 from app.config import settings
 from app.core.audit import record_audit_event
@@ -186,7 +186,7 @@ async def _create_status_list(db: AsyncSession) -> CredentialStatusList:
 )
 async def record_adult_verification(
     body: AdultVerificationRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_wallet_user),
     db: AsyncSession = Depends(get_db),
 ):
     """모바일에서 수행한 최초 성인·얼굴 대조 결과를 기록한다.
@@ -296,7 +296,7 @@ async def record_adult_verification(
 )
 async def issue_credential(
     body: IssueVcRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_wallet_user),
     db: AsyncSession = Depends(get_db),
 ):
     """성공한 최초 성인 인증 결과를 근거로 Holder에게 VC를 발급한다.

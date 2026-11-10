@@ -316,7 +316,10 @@ class SmsHttpE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["id"], user_id)
         self.assertEqual(response.json()["login_id"], login_id)
         self.assertEqual(response.json()["phone_number"], self.phone)
-        self.assertEqual(set(response.json()), {"id", "login_id", "name", "phone_number", "platform_role"})
+        self.assertEqual(
+            set(response.json()),
+            {"id", "login_id", "name", "phone_number", "platform_role", "status", "must_change_password"},
+        )
         async with self.session_factory() as db:
             challenge = await db.get(PhoneVerificationRequest, verification_id)
             self.assertIsNotNone(challenge.verified_at)
