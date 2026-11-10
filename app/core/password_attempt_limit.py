@@ -67,6 +67,17 @@ class PasswordAttemptLimiter:
 
             if events is None:
                 self._make_room(now)
+                if len(self._attempts) >= self._max_accounts:
+                    # Preserve active budgets; unknown account churn must not
+                    # erase another account's lock. Retry when a slot expires.
+                    unlock_at = min(
+                        timestamps[-1] + self._window_seconds
+                        for timestamps in self._attempts.values()
+                    )
+                    return PasswordAttempt(
+                        allowed=False,
+                        retry_after=max(1, math.ceil(unlock_at - now)),
+                    )
                 events = deque()
             else:
                 # 최근에 시도한 계정을 맨 뒤로 보내 오래 쉰 계정부터 밀려나게 한다.
@@ -97,7 +108,7 @@ class PasswordAttemptLimiter:
         return events
 
     def _make_room(self, now: float) -> None:
-        """새 계정을 넣기 전에 만료된 기록을 치우고, 그래도 가득 차면 가장 오래 쉰 계정을 뺀다.
+        """새 계정을 넣기 전에 만료된 기록만 치운다. 유효한 시도 기록은 보존한다.
 
         없는 아이디를 대량으로 넣어 메모리를 채우는 요청을 막기 위한 상한이다.
         """
@@ -105,5 +116,3 @@ class PasswordAttemptLimiter:
             return
         for key in list(self._attempts):
             self._fresh_events(key, now)
-        while len(self._attempts) >= self._max_accounts:
-            del self._attempts[next(iter(self._attempts))]

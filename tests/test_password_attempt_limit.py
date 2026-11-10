@@ -60,15 +60,36 @@ class PasswordAttemptLimiterTests(unittest.IsolatedAsyncioTestCase):
         results = await asyncio.gather(*(self.limiter.acquire("kiosk-a") for _ in range(20)))
         self.assertEqual(sum(result.allowed for result in results), 3)
 
-    async def test_capacity_evicts_least_recently_attempted_account(self):
+    async def test_capacity_preserves_locks_and_rejects_new_accounts(self):
         limiter = PasswordAttemptLimiter(limit=2, window_seconds=60, max_accounts=2, clock=self.clock)
-        await limiter.acquire("old")
-        await limiter.acquire("old")
-        await limiter.acquire("recent")
-        await limiter.acquire("new")  # 가득 차서 가장 오래 쉰 "old"가 밀려난다.
-
-        self.assertTrue((await limiter.acquire("old")).allowed)
+        await limiter.acquire("locked")
+        await limiter.acquire("locked")
+        self.clock.now += 10
+        await limiter.acquire("existing")
+        for index in range(20):
+            denied = await limiter.acquire(f"new-{index}")
+            self.assertFalse(denied.allowed)
+            self.assertEqual(denied.retry_after, 50)
+        self.assertFalse((await limiter.acquire("locked")).allowed)
+        self.assertTrue((await limiter.acquire("existing")).allowed)
         self.assertEqual(len(limiter._attempts), 2)
+
+        self.clock.now += 50
+        self.assertTrue((await limiter.acquire("new")).allowed)
+        self.assertFalse((await limiter.acquire("existing")).allowed)
+        self.assertEqual(len(limiter._attempts), 2)
+
+    async def test_capacity_retry_waits_for_whole_record_to_expire(self):
+        limiter = PasswordAttemptLimiter(limit=3, window_seconds=60, max_accounts=1, clock=self.clock)
+        await limiter.acquire("existing")
+        self.clock.now += 20
+        await limiter.acquire("existing")
+        self.clock.now += 40
+        denied = await limiter.acquire("new")
+        self.assertFalse(denied.allowed)
+        self.assertEqual(denied.retry_after, 20)
+        self.clock.now += 20
+        self.assertTrue((await limiter.acquire("new")).allowed)
 
     def test_rejects_non_positive_settings(self):
         with self.assertRaises(ValueError):
