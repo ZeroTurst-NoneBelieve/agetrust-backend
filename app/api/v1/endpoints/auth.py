@@ -712,12 +712,17 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     화면을 나눈다. must_change_password가 true면 비밀번호부터 바꿔야 한다 (#66).
     """
     attempt = await _acquire_password_attempt(body.login_id)
-    result = await db.execute(select(User).where(User.login_id == body.login_id))
-    user = result.scalar_one_or_none()
-    password_matches = verify_password_or_dummy(
-        body.password,
-        user.password_hash if user is not None else None,
-    )
+    try:
+        result = await db.execute(select(User).where(User.login_id == body.login_id))
+        user = result.scalar_one_or_none()
+        password_matches = verify_password_or_dummy(
+            body.password,
+            user.password_hash if user is not None else None,
+        )
+    except BaseException:
+        # No password verdict exists: DB errors/cancellation are not failures.
+        await password_attempt_limiter.cancel(body.login_id, attempt)
+        raise
     if not password_matches:
         await record_audit_event(
             db,

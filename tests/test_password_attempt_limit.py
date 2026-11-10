@@ -91,6 +91,23 @@ class PasswordAttemptLimiterTests(unittest.IsolatedAsyncioTestCase):
         self.clock.now += 20
         self.assertTrue((await limiter.acquire("new")).allowed)
 
+    async def test_cancel_preserves_other_attempts_at_same_timestamp(self):
+        first = await self.limiter.acquire("account")
+        await self.limiter.acquire("account")
+        await self.limiter.acquire("account")
+        await self.limiter.cancel("account", first)
+        await self.limiter.cancel("account", first)
+        self.assertTrue((await self.limiter.acquire("account")).allowed)
+        self.assertFalse((await self.limiter.acquire("account")).allowed)
+
+    async def test_stale_cancel_does_not_remove_new_reservations(self):
+        old = await self.limiter.acquire("account")
+        await self.limiter.clear("account")
+        for _ in range(3):
+            await self.limiter.acquire("account")
+        await self.limiter.cancel("account", old)
+        self.assertFalse((await self.limiter.acquire("account")).allowed)
+
     def test_rejects_non_positive_settings(self):
         with self.assertRaises(ValueError):
             PasswordAttemptLimiter(limit=0, window_seconds=60)

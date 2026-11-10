@@ -32,6 +32,7 @@ class PasswordAttempt:
     retry_after: int = 0
     # 이번 시도로 창 안의 시도가 한도에 이르렀다. 이번 시도도 틀리면 계정이 막히기 시작한다.
     reached_limit: bool = False
+    reservation: object | None = None
 
 
 class PasswordAttemptLimiter:
@@ -53,7 +54,7 @@ class PasswordAttemptLimiter:
         self._clock = clock
         self._lock = asyncio.Lock()
         # 계정 키 → 시도 시각들. dict는 삽입 순서를 지키므로 맨 앞이 가장 오래 쉰 계정이다.
-        self._attempts: dict[str, deque[float]] = {}
+        self._attempts: dict[str, deque[tuple[float, object]]] = {}
 
     async def acquire(self, account_key: str) -> PasswordAttempt:
         """한도 안이면 시도 한 번을 세고 허용한다. 한도에 걸렸으면 세지 않고 거부한다."""
@@ -62,7 +63,7 @@ class PasswordAttemptLimiter:
             events = self._fresh_events(account_key, now)
             if events is not None and len(events) >= self._limit:
                 # 창 안의 시도 중 limit번째로 최근 것이 창을 벗어나야 다시 한 번 시도할 수 있다.
-                unlock_at = events[-self._limit] + self._window_seconds
+                unlock_at = events[-self._limit][0] + self._window_seconds
                 return PasswordAttempt(allowed=False, retry_after=max(1, math.ceil(unlock_at - now)))
 
             if events is None:
@@ -71,7 +72,7 @@ class PasswordAttemptLimiter:
                     # Preserve active budgets; unknown account churn must not
                     # erase another account's lock. Retry when a slot expires.
                     unlock_at = min(
-                        timestamps[-1] + self._window_seconds
+                        timestamps[-1][0] + self._window_seconds
                         for timestamps in self._attempts.values()
                     )
                     return PasswordAttempt(
@@ -82,9 +83,22 @@ class PasswordAttemptLimiter:
             else:
                 # 최근에 시도한 계정을 맨 뒤로 보내 오래 쉰 계정부터 밀려나게 한다.
                 del self._attempts[account_key]
-            events.append(now)
+            reservation = object()
+            events.append((now, reservation))
             self._attempts[account_key] = events
-            return PasswordAttempt(allowed=True, reached_limit=len(events) == self._limit)
+            return PasswordAttempt(allowed=True, reached_limit=len(events) == self._limit, reservation=reservation)
+
+    async def cancel(self, account_key: str, attempt: PasswordAttempt) -> None:
+        """Return only this request's reservation if verification never completed."""
+        async with self._lock:
+            events = self._attempts.get(account_key)
+            if events is None or attempt.reservation is None:
+                return
+            remaining = deque(event for event in events if event[1] is not attempt.reservation)
+            if remaining:
+                self._attempts[account_key] = remaining
+            else:
+                self._attempts.pop(account_key, None)
 
     async def clear(self, account_key: str) -> None:
         """비밀번호가 맞았을 때 그 계정의 시도 기록을 지운다."""
@@ -95,12 +109,12 @@ class PasswordAttemptLimiter:
         async with self._lock:
             self._attempts.clear()
 
-    def _fresh_events(self, account_key: str, now: float) -> deque[float] | None:
+    def _fresh_events(self, account_key: str, now: float) -> deque[tuple[float, object]] | None:
         events = self._attempts.get(account_key)
         if events is None:
             return None
         threshold = now - self._window_seconds
-        while events and events[0] <= threshold:
+        while events and events[0][0] <= threshold:
             events.popleft()
         if not events:
             del self._attempts[account_key]
