@@ -732,6 +732,112 @@ class AdultVerificationE2ETests(unittest.IsolatedAsyncioTestCase):
             "보통은 bcrypt를 쓰는 signup/login이 가장 느리다.",
         )
 
+    async def test_lost_response_rotation_revokes_old_and_keeps_one_active(self):
+        from sqlalchemy import select
+        from app.models import VcCredential, CredentialStatusList
+        from app.core.status_list import decode_bitstring, get_bit
+
+        _, _, auth = await self._signed_up_user()
+        device_id, old_holder = await self._bound_device(auth)
+
+        async def verify():
+            response = await self.client.post(
+                "/api/v1/adult-verifications",
+                headers=auth,
+                json={
+                    "device_id": device_id,
+                    "age_check_passed": True,
+                    "id_face_match_passed": True,
+                    "liveness_passed": True,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["id"]
+
+        verification_id = await verify()
+        # Server commits, but the client deliberately discards the VC response.
+        lost = await self.client.post(
+            "/api/v1/did/issue", headers=auth, json={"adult_verification_id": verification_id}
+        )
+        self.assertEqual(lost.status_code, 200, lost.text)
+        del lost
+        async with self.session_factory() as db:
+            old = (await db.scalars(select(VcCredential).where(VcCredential.device_id == device_id))).one()
+            self.assertEqual(old.status, "ACTIVE")
+            old_id = old.id
+        # Renew evidence, then rotate using the existing endpoint.
+        recovery_verification = await verify()
+        pem, proof = _holder_material(device_id)
+        binding = {"device_id": device_id, "holder_public_key_pem": pem, "proof_signature_b64": proof}
+        for _ in range(2):  # A lost bind response can safely be retried with the SAME key.
+            response = await self.client.post("/api/v1/auth/devices/bind-holder-key", headers=auth, json=binding)
+            self.assertEqual(response.status_code, 200, response.text)
+            new_holder = response.json()["holder_did"]
+            self.assertNotEqual(old_holder, new_holder)
+        async with self.session_factory() as db:
+            old = await db.get(VcCredential, old_id)
+            self.assertEqual(old.status, "REVOKED")
+            status_list = await db.get(CredentialStatusList, old.status_list_id)
+            self.assertTrue(get_bit(decode_bitstring(status_list.encoded_list), old.status_list_index))
+        response = await self.client.post(
+            "/api/v1/did/issue", headers=auth, json={"adult_verification_id": recovery_verification}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["holder_did"], new_holder)
+        async with self.session_factory() as db:
+            rows = list(await db.scalars(select(VcCredential).where(VcCredential.device_id == device_id)))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(row.status == "ACTIVE" for row in rows), 1)
+            active = next(row for row in rows if row.status == "ACTIVE")
+            status_list = await db.get(CredentialStatusList, active.status_list_id)
+            self.assertFalse(get_bit(decode_bitstring(status_list.encoded_list), active.status_list_index))
+
+    async def test_ranges_and_timezone_boundaries(self):
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import delete
+        from app.models import AuditLog
+
+        headers = await self._admin_headers()
+        end = datetime(2026, 11, 10, 18, 0, tzinfo=timezone(timedelta(hours=9)))
+
+        # Cleanup runs after asyncTearDown; dispose connections opened by cleanup too.
+        self.addAsyncCleanup(self.engine.dispose)
+
+        async def remove_fixtures(marker):
+            async with self.session_factory() as db:
+                await db.execute(delete(AuditLog).where(AuditLog.event_type == marker))
+                await db.commit()
+
+        starts = [end.replace(hour=0), end - timedelta(days=7), end - timedelta(days=30)]
+        for start in starts:
+            marker = "date-review-" + uuid.uuid4().hex
+            self.addAsyncCleanup(remove_fixtures, marker)
+            async with self.session_factory() as db:
+                for stamp in [start - timedelta(microseconds=1), start, end - timedelta(microseconds=1), end]:
+                    db.add(
+                        AuditLog(
+                            event_id=uuid.uuid4(),
+                            event_type=marker,
+                            actor_type="SYSTEM",
+                            payload={},
+                            event_hash="fixture",
+                            created_at=stamp,
+                        )
+                    )
+                await db.commit()
+            for utc in [False, True]:
+                params = {
+                    "event_type": marker,
+                    "occurred_from": (start.astimezone(timezone.utc) if utc else start).isoformat(),
+                    "occurred_to": (end.astimezone(timezone.utc) if utc else end).isoformat(),
+                }
+                response = await self.client.get("/api/v1/admin/logs", headers=headers, params=params)
+                self.assertEqual(response.status_code, 200, response.text)
+                page = response.json()
+                self.assertEqual(page["total"], 2)
+                actual = [datetime.fromisoformat(row["created_at"]) for row in page["items"]]
+                self.assertEqual(actual, [end - timedelta(microseconds=1), start])
+
 
 if __name__ == "__main__":
     unittest.main()
