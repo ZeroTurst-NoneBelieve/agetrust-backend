@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     otp_request_global_window_seconds: int = 3600
     # 계정별 비밀번호 실패 제한 (#68). 로그인·비밀번호 변경이 함께 센다.
     # OTP 발송 제한과 같이 단일 FastAPI 프로세스의 메모리에서 센다.
-    password_failure_limit: int = Field(default=5, ge=1)
+    password_failure_limit: int = Field(default=3, ge=1)
     password_failure_window_seconds: int = Field(default=900, ge=1)
 
     # SOLAPI — DEV_MODE=false일 때 전화번호 인증 OTP를 실제 문자로 보낸다.

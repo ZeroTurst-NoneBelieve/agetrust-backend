@@ -82,7 +82,7 @@ pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 | `OTP_REQUEST_LIMIT_PER_CLIENT` / `OTP_REQUEST_LIMIT_WINDOW_SECONDS` | 접속 IP별 실제 발송 한도와 시간 창. 기본값은 10분에 10건입니다 |
 | `OTP_REQUEST_LIMIT_PER_RECIPIENT` / `OTP_REQUEST_RECIPIENT_WINDOW_SECONDS` | 수신번호별 장기 발송 한도와 시간 창. 기본값은 1시간에 6건입니다 |
 | `OTP_REQUEST_GLOBAL_LIMIT` / `OTP_REQUEST_GLOBAL_WINDOW_SECONDS` | 서버 프로세스 전체의 실제 발송 한도와 시간 창. 기본값은 1시간에 100건입니다 |
-| `PASSWORD_FAILURE_LIMIT` / `PASSWORD_FAILURE_WINDOW_SECONDS` | 계정별 비밀번호 시도 한도와 시간 창. 로그인·비밀번호 변경이 함께 셉니다. 기본값은 15분에 5회입니다 |
+| `PASSWORD_FAILURE_LIMIT` / `PASSWORD_FAILURE_WINDOW_SECONDS` | 계정별 비밀번호 시도 한도와 시간 창. 로그인·비밀번호 변경이 함께 셉니다. 기본값은 15분에 3회입니다 |
 
 나머지(Kafka 주소, 토픽, OTP·토큰 만료 시간 등)는 `app/config.py`에 기본값이 있어 그대로 두어도 됩니다.
 
@@ -454,7 +454,7 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 #### 비밀번호 시도 횟수 제한
 
 로그인(`/auth/login`)과 비밀번호 변경(`/auth/password`)은 **계정(login_id)별로 시도 횟수를 함께 셉니다.**
-기본값은 15분에 5회이며 `PASSWORD_FAILURE_LIMIT`, `PASSWORD_FAILURE_WINDOW_SECONDS`로 바꿀 수 있습니다.
+기본값은 15분에 3회이며 `PASSWORD_FAILURE_LIMIT`, `PASSWORD_FAILURE_WINDOW_SECONDS`로 바꿀 수 있습니다.
 
 - 한도에 걸리면 맞는 비밀번호를 넣어도 `429 TOO_MANY_PASSWORD_ATTEMPTS`가 나갑니다. 비밀번호를 검사하지 않습니다.
 - 비밀번호가 맞으면 그 계정의 기록이 지워집니다.

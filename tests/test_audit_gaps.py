@@ -24,7 +24,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 os.environ.setdefault("SECRET_KEY", "test-secret-key-at-least-32-bytes")
 os.environ.setdefault("ISSUER_PRIVATE_KEY", base64.b64encode(bytes(range(32))).decode())
 
-from app.api.v1.endpoints.auth import login, verify_phone_otp  # noqa: E402
+from app.api.v1.endpoints.auth import login, password_attempt_limiter, verify_phone_otp  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.core.security import hash_otp, hash_password  # noqa: E402
 from app.models import PhoneVerificationRequest, User  # noqa: E402
@@ -36,6 +36,11 @@ from tests.fakes import FakeDb  # noqa: E402
 
 class LoginFailureAuditTests(unittest.IsolatedAsyncioTestCase):
     """로그인 실패 로그가 계정 존재 여부를 드러내지 않아야 한다."""
+
+    async def asyncSetUp(self):
+        # 같은 아이디로 여러 번 틀리므로, 프로세스에 남는 시도 제한 기록을 테스트마다 비운다 (#68).
+        await password_attempt_limiter.reset()
+        self.addAsyncCleanup(password_attempt_limiter.reset)
 
     async def _login_failure_log(self, user):
         db = FakeDb(scalar_results={User: user})
