@@ -31,17 +31,42 @@ def _contains_database_error(error: BaseException) -> bool:
     return False
 
 
+def _safe_exception_locations(error: BaseException) -> str:
+    """메시지·소스 코드·로컬 변수 없이 예외 체인의 코드 위치만 추출한다."""
+    lines = []
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        lines.append(type(current).__name__)
+        tb = current.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            lines.append(f"  File {code.co_filename!r}, line {tb.tb_lineno}, in {code.co_name}")
+            tb = tb.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif current.__context__ is not None and not current.__suppress_context__:
+            pending.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+    return "\n".join(lines)
+
+
 class DatabaseErrorFilter(logging.Filter):
-    """DB 예외 원문·드라이버 DETAIL·체인 traceback을 출력하지 않는다.
+    """DB 예외 원문·드라이버 DETAIL 대신 안전한 코드 위치만 출력한다.
 
     hide_parameters는 드라이버가 오류 문자열에 포함한 값까지 숨기지 않는다.
-    작업 문구는 유지하고 DB 예외는 타입만 남긴다.
+    작업 문구와 예외 타입·파일·함수·줄 번호는 유지한다.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         def safe_argument(value):
             if isinstance(value, BaseException) and _contains_database_error(value):
-                return type(value).__name__
+                return _safe_exception_locations(value)
             return value
 
         if isinstance(record.args, dict):
@@ -51,8 +76,8 @@ class DatabaseErrorFilter(logging.Filter):
         if isinstance(record.msg, BaseException):
             record.msg = safe_argument(record.msg)
         if record.exc_info and record.exc_info[1] and _contains_database_error(record.exc_info[1]):
-            error_type = type(record.exc_info[1]).__name__
-            record.msg = f"{record.getMessage()} (database exception: {error_type})"
+            locations = _safe_exception_locations(record.exc_info[1])
+            record.msg = f"{record.getMessage()} (database exception)\n{locations}"
             record.args = ()
             record.exc_info = None
             record.exc_text = None
