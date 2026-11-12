@@ -374,6 +374,66 @@ class AccountSessionDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(devices.status_code, 200, devices.text)
         self.assertEqual(devices.json(), [])
 
+    async def test_logout_revokes_every_token_of_the_account(self):
+        """로그아웃 전에 빼돌린 토큰도, 다른 기기의 토큰도 더는 쓸 수 없다 (#73)."""
+        user = await self._create_wallet_user()
+        this_device = (await self._login(user.login_id, USER_PASSWORD)).json()
+        other_device = (await self._login(user.login_id, USER_PASSWORD)).json()
+
+        logout = await self.client.post("/api/v1/auth/logout", headers=self._bearer(this_device["access_token"]))
+        self.assertEqual(logout.status_code, 204, logout.text)
+
+        for tokens in (this_device, other_device):
+            me = await self.client.get("/api/v1/auth/me", headers=self._bearer(tokens["access_token"]))
+            self._assert_error(me, 401, "TOKEN_REVOKED")
+            refresh = await self.client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+            self._assert_error(refresh, 401, "TOKEN_REVOKED")
+
+        async with self.session_factory() as db:
+            audit = (
+                await db.execute(
+                    select(AuditLog).where(AuditLog.event_type == "LOGOUT", AuditLog.aggregate_id == str(user.id))
+                )
+            ).scalar_one()
+            self.assertEqual(audit.actor_type, "USER")
+
+        # 다시 로그인하면 새 토큰은 정상이다.
+        relogin = await self._login(user.login_id, USER_PASSWORD)
+        self.assertEqual(relogin.status_code, 200, relogin.text)
+        me = await self.client.get("/api/v1/auth/me", headers=self._bearer(relogin.json()["access_token"]))
+        self.assertEqual(me.status_code, 200, me.text)
+
+    async def test_logout_requires_a_live_access_token(self):
+        user = await self._create_wallet_user()
+        tokens = (await self._login(user.login_id, USER_PASSWORD)).json()
+
+        self._assert_error(await self.client.post("/api/v1/auth/logout"), 401, "TOKEN_MISSING")
+        # 리프레시 토큰으로는 로그아웃할 수 없다.
+        by_refresh = await self.client.post("/api/v1/auth/logout", headers=self._bearer(tokens["refresh_token"]))
+        self._assert_error(by_refresh, 401, "TOKEN_WRONG_TYPE")
+
+        first = await self.client.post("/api/v1/auth/logout", headers=self._bearer(tokens["access_token"]))
+        self.assertEqual(first.status_code, 204, first.text)
+        again = await self.client.post("/api/v1/auth/logout", headers=self._bearer(tokens["access_token"]))
+        self._assert_error(again, 401, "TOKEN_REVOKED")
+
+    async def test_kiosk_account_can_log_out_before_changing_temp_password(self):
+        kiosk = await self._create_kiosk_account()
+        tokens = (await self._login(kiosk.login_id, TEMP_PASSWORD)).json()
+
+        logout = await self.client.post("/api/v1/auth/logout", headers=self._bearer(tokens["access_token"]))
+        self.assertEqual(logout.status_code, 204, logout.text)
+        refresh = await self.client.post("/api/v1/auth/refresh", json={"refresh_token": tokens["refresh_token"]})
+        self._assert_error(refresh, 401, "TOKEN_REVOKED")
+
+        async with self.session_factory() as db:
+            audit = (
+                await db.execute(
+                    select(AuditLog).where(AuditLog.event_type == "LOGOUT", AuditLog.aggregate_id == str(kiosk.id))
+                )
+            ).scalar_one()
+            self.assertEqual(audit.actor_type, "USER")
+
     async def _locked_audit_rows(self, login_id: str) -> list[AuditLog]:
         async with self.session_factory() as db:
             result = await db.execute(
