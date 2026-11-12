@@ -39,7 +39,7 @@ def _deny(code: AuthError, status_code: int = status.HTTP_401_UNAUTHORIZED):
 
 
 def is_token_revoked(user: User, claims: dict) -> bool:
-    """정지·비밀번호 초기화·변경으로 token_version이 올라가기 전에 발급된 토큰인가 (#66).
+    """정지·비밀번호 초기화·변경·로그아웃으로 token_version이 올라가기 전에 발급된 토큰인가 (#66, #73).
 
     ver가 없는 예전 토큰은 0으로 본다. 그래서 기존 계정의 토큰은 그대로 쓸 수 있다.
     """

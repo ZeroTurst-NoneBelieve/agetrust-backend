@@ -428,6 +428,47 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 정지·해제는 이미 그 상태면 아무것도 바꾸지 않고 감사 로그도 남기지 않습니다. 비밀번호 재발급은
 정지 상태를 바꾸지 않습니다.
 
+### 운영 절차
+
+계정은 **사업자 단위**로 발급합니다. 매장 등록 API와 자동 이메일 발송은 두지 않았으므로
+아래 절차를 관리자가 직접 진행합니다.
+
+**1. 사업자등록번호 확인 (수동).** 서버는 번호의 진위를 확인하지 않고 길이(1~50자)만 봅니다.
+관리자가 국세청 홈택스의 사업자등록 상태 조회 등으로 계속사업자인지 직접 확인한 뒤 등록합니다.
+같은 번호를 하이픈 유무만 다르게 넣으면 다른 사업자로 저장되므로 **항상 `123-45-67890` 형식**으로
+입력합니다.
+
+**2. 계정 발급.** `POST /api/v1/admin/kiosk-accounts`로 계정을 만들고, 응답의 `business.business_id`를
+확인합니다.
+
+**3. 매장 등록 (DB).** 매장이 없으면 DB 콘솔에서 만듭니다. `<business_id>`는 2번에서 확인한 값입니다.
+
+```sql
+INSERT INTO stores (business_id, store_code, store_name, store_type_code, address)
+VALUES (<business_id>, '<중복 없는 매장 코드>', '<매장 이름>', '<업종 코드>', '<주소>')
+RETURNING id;
+```
+
+**4. 키오스크 단말 등록.** 3번의 `id`를 `store_id`로 7번 절차(`POST /api/v1/admin/kiosks`)를 따라
+`kiosk_identifier`와 API Key를 발급합니다. 키는 **24시간 안에 한 번 인증해야** 하므로 설치 일정에
+맞춰 발급합니다.
+
+**5. 전달.** 관리자가 사업자에게 아이디, 임시 비밀번호, `kiosk_identifier`, API Key를 이메일로
+직접 보냅니다. 보낸 뒤에는 보관하지 않습니다. 임시 비밀번호는 72시간 안에 바꿔야 합니다.
+
+**계정을 정지할 때는 단말도 함께 폐기합니다.** 계정 정지는 로그인 토큰만 막고, 키오스크 단말의
+API Key(상태 목록 조회·결과 업로드)는 막지 않습니다. 정지한 계정의 사업자에 속한 단말을 찾아
+
+```sql
+SELECT k.kiosk_identifier, k.status
+FROM kiosks k
+JOIN stores s ON s.id = k.store_id
+WHERE s.business_id = <business_id> AND k.status = 'ACTIVE';
+```
+
+각 단말에 `POST /api/v1/admin/kiosks/{kiosk_identifier}/revoke`를 호출합니다. 계정을 다시 활성화해도
+폐기한 단말은 되살릴 수 없으므로 4번부터 새로 등록합니다.
+
 ### 앱: 첫 로그인
 
 1. `POST /api/v1/auth/login`에 아이디와 임시 비밀번호를 보내 토큰을 받습니다.
@@ -436,7 +477,7 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 3. `POST /api/v1/auth/password`에 `{"current_password": "<임시>", "new_password": "<8자 이상>"}`을
    보냅니다. 응답의 **새 토큰으로 교체**합니다. 이전 토큰은 무효가 됩니다.
 
-비밀번호를 바꾸기 전에는 `/auth/me`와 `/auth/password` 외의 API가 `403 PASSWORD_CHANGE_REQUIRED`입니다.
+비밀번호를 바꾸기 전에는 `/auth/me`, `/auth/password`, `/auth/logout` 외의 API가 `403 PASSWORD_CHANGE_REQUIRED`입니다.
 `POST /api/v1/auth/password`는 USER 계정도 비밀번호 변경에 쓸 수 있습니다.
 
 임시 비밀번호는 발급 후 72시간 이내에 변경을 완료해야 합니다. 기한 안에 로그인했더라도 변경 요청 시 만료되었다면 거부되며, 관리자에게 재발급을 요청해야 합니다.
@@ -483,7 +524,21 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 `tests/test_kiosk_account_admin_db.py`(관리자 계정 관리)는 `E2E_DATABASE_URL`이 있을 때 실제
 PostgreSQL로 검증합니다.
 
-## 10. CI
+## 10. 시연 전 점검
+
+서버·앱·키오스크를 연결하기 전에 확인합니다. 하나라도 어긋나면 검증 전체가 실패할 수 있습니다.
+
+| 항목 | 확인 내용 |
+|---|---|
+| `PUBLIC_BASE_URL` | 앱·키오스크가 접속하는 서버 주소와 같아야 합니다. 이 값은 **첫 VC를 발급할 때** `credential_status_lists.status_list_url`에 저장되고 이후 바뀌지 않으며, 키오스크는 VC 안의 주소가 접속 주소와 다르면 VC를 거부합니다. 값을 먼저 맞춘 뒤 VC를 발급하고, 잘못 발급했다면 개발 DB를 초기화하고 다시 발급합니다 |
+| `ISSUER_PRIVATE_KEY` | 팀에서 공유하는 같은 값을 씁니다. 키오스크는 처음 본 발급자 DID를 기억하므로 다른 키로 띄운 서버의 VC는 거부합니다 |
+| 키오스크 API Key | 발급 후 24시간 안에 한 번도 쓰지 않으면 자동 폐기됩니다. 시연 24시간 이내에 발급하거나, 발급 직후 검증을 한 번 실행합니다 |
+| 기기 시계 | QR·VP 유효 시간이 60초라, 서버·휴대폰·키오스크 시계가 1분 가까이 어긋나면 검증이 실패합니다. 자동 시간 설정을 켭니다 |
+| `VC_EXPIRE_DAYS` | 기본값(365)을 씁니다. 키오스크는 만료 시각(`exp`)이 없는 VC를 거부합니다 |
+| 시연 계정 비밀번호 | 15분에 3번 틀리면 15분 동안 잠깁니다. 잠기면 서버를 재시작하면 풀립니다 |
+| 앱 빌드 | 디버그 빌드가 아니면 HTTPS 서버 주소만 허용합니다 |
+
+## 11. CI
 
 `dev`/`main` 대상 PR과 두 브랜치로의 push에서 `.github/workflows/ci.yml`이 돕니다.
 
