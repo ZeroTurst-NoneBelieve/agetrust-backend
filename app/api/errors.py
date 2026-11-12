@@ -46,7 +46,7 @@ AUTHENTICATED_RESPONSES = {
             "액세스 토큰이 없거나(TOKEN_MISSING) 만료(TOKEN_EXPIRED) · "
             "위조(TOKEN_INVALID) · 종류가 다르거나(TOKEN_WRONG_TYPE) "
             "토큰의 사용자가 없음(USER_NOT_FOUND) · "
-            "정지·비밀번호 변경으로 무효가 된 토큰(TOKEN_REVOKED)"
+            "정지·비밀번호 변경·로그아웃으로 무효가 된 토큰(TOKEN_REVOKED)"
         ),
     },
     403: {
@@ -59,7 +59,7 @@ AUTHENTICATED_RESPONSES = {
     },
 }
 
-# 임시 비밀번호 상태에서도 열려 있는 경로(/auth/me, /auth/password)용.
+# 임시 비밀번호 상태에서도 열려 있는 경로(/auth/me, /auth/password, /auth/logout)용.
 # PASSWORD_CHANGE_REQUIRED·PERMISSION_DENIED는 없고, 정지·탈퇴만 403이다.
 SESSION_RESPONSES = {
     401: AUTHENTICATED_RESPONSES[401],

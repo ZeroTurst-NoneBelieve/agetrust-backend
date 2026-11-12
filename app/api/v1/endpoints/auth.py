@@ -788,7 +788,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
             "model": AuthErrorResponse,
             "description": (
                 "리프레시 토큰이 유효하지 않거나 만료됨 · "
-                "정지·비밀번호 변경으로 무효가 된 토큰(TOKEN_REVOKED)"
+                "정지·비밀번호 변경·로그아웃으로 무효가 된 토큰(TOKEN_REVOKED)"
             ),
         },
         403: {
@@ -830,13 +830,37 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
     "/logout",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="로그아웃",
+    responses=SESSION_RESPONSES,
 )
-async def logout():
-    """로그아웃한다.
+async def logout(
+    user: User = Depends(get_current_user_allowing_password_change),
+    db: AsyncSession = Depends(get_db),
+):
+    """로그아웃하고 이 계정의 기존 토큰을 모두 무효로 만든다 (#73).
 
-    MVP 범위에서는 서버가 토큰을 무효화하지 않으므로, 클라이언트가
-    보관 중인 토큰을 폐기하는 것으로 로그아웃이 완료된다.
+    token_version을 올려 액세스·리프레시 토큰을 함께 끊는다. 클라이언트가
+    지우기 전에 빼돌린 토큰도 더는 쓸 수 없다. 계정 단위라 다른 기기의
+    세션도 함께 끝난다. 임시 비밀번호 상태에서도 로그아웃할 수 있다.
+
+    이미 무효인 토큰이면 401이다. 앱은 응답과 관계없이 보관 중인 토큰을 지운다.
     """
+    # 비밀번호 변경과 겹쳐도 올린 값이 사라지지 않도록 행을 잠근다.
+    locked = await db.get(User, user.id, with_for_update=True, populate_existing=True)
+    if locked is None:
+        raise _fail(AuthError.USER_NOT_FOUND)
+    locked.token_version += 1
+    locked.updated_at = datetime.now(timezone.utc)
+
+    await record_audit_event(
+        db,
+        event_type=AuditEventType.LOGOUT.value,
+        actor_type=_actor_type(locked),
+        actor_ref=str(locked.id),
+        aggregate_type=AuditAggregateType.USER.value,
+        aggregate_id=str(locked.id),
+        payload={},
+    )
+    await db.commit()
     return None
 
 
