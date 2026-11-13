@@ -11,8 +11,27 @@
 from enum import StrEnum
 
 from fastapi import HTTPException
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from app.schemas.errors import AuthErrorResponse
+
+
+async def safe_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422의 detail 목록은 유지하되 입력값과 예외 메시지는 노출하지 않는다.
+
+    input에는 요청 본문 전체가, ctx와 msg에는 validator가 삽입한 입력값이
+    포함될 수 있다. 원본 오류를 복사하거나 로그에 남기지 않고 허용 필드만 만든다.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": [
+            {"type": error["type"], "loc": list(error["loc"]), "msg": "Invalid request value"}
+            for error in exc.errors()
+        ]},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def api_error(

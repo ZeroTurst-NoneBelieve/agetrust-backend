@@ -3,9 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.api import api_router
+from app.api.errors import safe_validation_error_handler
 from app.config import log_defaulted_settings, settings
 from app.core.kiosk_key_cleanup import run_unused_key_cleanup_loop
 from app.core.logging import configure_logging
@@ -49,6 +51,7 @@ app = FastAPI(
 )
 
 app.include_router(api_router)
+app.add_exception_handler(RequestValidationError, safe_validation_error_handler)
 
 app.add_middleware(
     CORSMiddleware,
