@@ -153,6 +153,8 @@ docker compose up -d postgres     # DB만 띄우기 (Kafka까지 필요하면 �
 alembic upgrade head              # 최신 리비전까지 스키마 적용
 ```
 
+DB(5432)와 Kafka(9092)는 **compose를 띄운 PC에서만** `localhost`로 접속할 수 있습니다. 다른 기기에서는 API(8000)만 열려 있습니다.
+
 이미 적용된 리비전 파일은 수정하지 않는 것이 이 저장소의 규칙입니다. 스키마를 바꿔야 하면 새 리비전을 만드세요.
 
 ### `d4f8a2b16c07`에서 멈춘다면
