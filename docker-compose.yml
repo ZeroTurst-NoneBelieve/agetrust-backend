@@ -35,8 +35,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required. Set it in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. Set it in .env}
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required. Set it in .env}
+    # 호스트(노트북)에서만 접속하게 127.0.0.1에 묶는다. 0.0.0.0이면 같은 네트워크의
+    # 다른 기기가 DB에 직접 붙을 수 있다. backend 컨테이너는 내부 네트워크(postgres:5432)로 붙는다.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -89,8 +91,10 @@ services:
     # 아직 남아 있어 "node already exists"로 기동에 실패할 수 있다. 옛 세션은
     # 수십 초 안에 만료되므로, 한 번 죽어도 알아서 다시 뜨게 둔다.
     restart: on-failure
+    # Kafka 리스너는 인증 없는 PLAINTEXT다. 바깥 기기가 이벤트를 읽거나 넣지 못하게
+    # 호스트 포트는 127.0.0.1에만 연다. 컨테이너끼리는 kafka:29092로 붙으므로 영향이 없다.
     ports:
-      - "9092:9092"
+      - "127.0.0.1:9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
