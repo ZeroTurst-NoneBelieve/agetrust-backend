@@ -440,7 +440,7 @@ SHA-256만 저장하며, `(kiosk_id, nonce_hash)` UNIQUE로 동시에 도착한 
 같은 번호를 하이픈 유무만 다르게 넣으면 다른 사업자로 저장되므로 **항상 `123-45-67890` 형식**으로
 입력합니다.
 
-**2. 계정 발급.** `POST /api/v1/admin/kiosk-accounts`로 계정을 만들고, 응답의 `business.business_id`를
+**2. 계정 발급.** `POST /api/v1/admin/kiosk-accounts`로 계정을 만들고, 응답의 `account.business.business_id`를
 확인합니다.
 
 **3. 매장 등록 (DB).** 매장이 없으면 DB 콘솔에서 만듭니다. `<business_id>`는 2번에서 확인한 값입니다.
